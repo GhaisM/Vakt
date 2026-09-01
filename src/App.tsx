@@ -271,6 +271,7 @@ function Dashboard({ data }: { data: AppData }) {
 // --- VAKTER TAB (LIST + FORM) ---
 function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) => void }) {
   const [isEditing, setIsEditing] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
   const activeJobs = data.jobs.filter(j => !j.deleted);
 
@@ -296,16 +297,17 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.jobId) return alert('Velg en jobb først!');
+    setErrorMsg(null);
+    if (!formData.jobId) return setErrorMsg('Velg en jobb først!');
 
     const tzOffset = new Date().getTimezoneOffset() * 60000;
     const iDagStr = new Date(Date.now() - tzOffset).toISOString().split('T')[0];
 
     if (formData.status === 'Fullfort' && formData.dato > iDagStr) {
-      return alert("Feil: Du kan ikke logge en jobb som 'Fullført' hvis datoen er frem i tid!");
+      return setErrorMsg("Feil: Du kan ikke logge en jobb som 'Fullført' hvis datoen er frem i tid!");
     }
     if (formData.status === 'Kommende' && formData.dato < iDagStr) {
-      return alert("Feil: Datoen er i fortiden. Sett status til 'Fullført'.");
+      return setErrorMsg("Feil: Datoen er i fortiden. Sett status til 'Fullført'.");
     }
 
     if (isEditing) {
@@ -326,9 +328,8 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
   };
 
   const handleDelete = (id: string) => {
-    if (confirm("Er du sikker på at du vil slette denne vakten?")) {
-      onUpdate({ ...data, shifts: data.shifts.filter(s => s.id !== id) });
-    }
+    onUpdate({ ...data, shifts: data.shifts.filter(s => s.id !== id) });
+    setErrorMsg(null);
   };
 
   const handleComplete = (id: string) => {
@@ -337,12 +338,13 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
     const tzOffset = new Date().getTimezoneOffset() * 60000;
     const iDagStr = new Date(Date.now() - tzOffset).toISOString().split('T')[0];
     if (shift.dato > iDagStr) {
-      return alert("Vent litt! Du kan ikke godkjenne denne vakten ennå fordi datoen er i fremtiden.");
+      return setErrorMsg("Du kan ikke godkjenne denne vakten ennå fordi datoen er i fremtiden.");
     }
     onUpdate({
       ...data,
       shifts: data.shifts.map(s => s.id === id ? { ...s, status: 'Fullfort' } : s)
     });
+    setErrorMsg(null);
   };
 
   const sortedShifts = [...data.shifts].sort((a,b) => new Date(b.dato).getTime() - new Date(a.dato).getTime());
@@ -366,6 +368,15 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+            {errorMsg && (
+              <div className="bg-red-900/30 text-red-400 p-3 rounded-xl text-sm flex items-center justify-between border border-red-500/20">
+                <div className="flex gap-2 items-center">
+                  <AlertCircle size={18} className="shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
+                <button type="button" onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-300 ml-2">✕</button>
+              </div>
+            )}
             <div>
               <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Jobb</label>
               <select 
@@ -527,6 +538,7 @@ function KalenderTab({ data }: { data: AppData }) {
 // --- INNSTILLINGER TAB ---
 function InnstillingerTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) => void }) {
   const [newJob, setNewJob] = useState({ navn: '', lonn: '', ferie: '10' });
+  const [importStatus, setImportStatus] = useState<{ type: 'success'|'error', msg: string } | null>(null);
 
   const activeJobs = data.jobs.filter(j => !j.deleted);
 
@@ -547,16 +559,17 @@ function InnstillingerTab({ data, onUpdate }: { data: AppData, onUpdate: (d: App
   const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setImportStatus(null);
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
         const importedData = JSON.parse(event.target?.result as string);
         if (importedData.myJobs) localStorage.setItem('myJobs', importedData.myJobs);
         if (importedData.myShifts) localStorage.setItem('myShifts', importedData.myShifts);
-        alert("Backup lastet inn! Siden oppdateres nå.");
-        window.location.reload();
+        setImportStatus({ type: 'success', msg: 'Backup lastet inn! Last siden på nytt for å se endringene.' });
+        setTimeout(() => window.location.reload(), 1500);
       } catch (err) {
-        alert("Feil ved innlesing av fil.");
+        setImportStatus({ type: 'error', msg: 'Feil ved innlesing av fil. Sjekk at det er riktig JSON-fil.' });
       }
     };
     reader.readAsText(file);
@@ -576,12 +589,10 @@ function InnstillingerTab({ data, onUpdate }: { data: AppData, onUpdate: (d: App
   };
 
   const handleDeleteJob = (id: string) => {
-    if (confirm("Er du sikker? Historikk fra denne jobben vil bevares på gamle vakter, men du kan ikke lenger logge nye vakter på den.")) {
-      onUpdate({
-        ...data,
-        jobs: data.jobs.map(j => j.id === id ? { ...j, deleted: true } : j)
-      });
-    }
+    onUpdate({
+      ...data,
+      jobs: data.jobs.map(j => j.id === id ? { ...j, deleted: true } : j)
+    });
   };
 
   return (
@@ -632,6 +643,14 @@ function InnstillingerTab({ data, onUpdate }: { data: AppData, onUpdate: (d: App
 
       <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow">
         <h2 className="text-xl font-bold text-white mb-5 tracking-tight">Backup & Data</h2>
+        
+        {importStatus && (
+          <div className={`p-4 rounded-xl text-sm font-medium mb-4 flex gap-2 items-center ${importStatus.type === 'success' ? 'bg-green-900/30 text-green-400 border border-green-500/20' : 'bg-red-900/30 text-red-400 border border-red-500/20'}`}>
+            <AlertCircle size={18} className="shrink-0" />
+            {importStatus.msg}
+          </div>
+        )}
+
         <div className="flex flex-col gap-3">
           <button onClick={handleExport} className="w-full bg-[#2c2c2e] text-white font-bold py-4 rounded-2xl transition-colors hover:bg-[#38383a] active:scale-[0.98]">
             💾 Lagre Backup (Eksport)
