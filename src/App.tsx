@@ -392,7 +392,7 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
     }
     
     // Keep daytime defaults for the next entry.
-    setFormData(prev => ({ ...prev, start: '09:00', slutt: '17:00', status: 'Fullfort' }));
+    setFormData(prev => ({ ...prev, dato: today(), status: 'Fullfort' }));
   };
 
   const handleDelete = (id: string) => {
