@@ -680,7 +680,7 @@ function InnstillingerTab({
       <section className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow border border-[#2c2c2e]" aria-labelledby="install-app-heading">
         <h2 id="install-app-heading" className="text-xl font-bold text-white mb-2">Bruk Vakter som app</h2>
         <p className="text-sm text-gray-400 leading-relaxed">
-          Legg Vakter på hjemskjermen for rask tilgang. Vaktene lagres på denne enheten og kan brukes uten nett etter at appen er lastet ned én gang.
+          Legg Vakter på hjemskjermen for rask tilgang. Vaktene lagres på denne enheten og blir tilgjengelige uten nett etter første åpning mens du er på nett. Registreringene synkroniseres ikke automatisk mellom enheter.
         </p>
         {isInstalled ? (
           <p className="mt-4 rounded-xl bg-green-900/30 px-4 py-3 text-sm font-semibold text-green-300">Vakter er installert på denne enheten.</p>
