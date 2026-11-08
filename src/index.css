@@ -7,7 +7,7 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     -webkit-tap-highlight-color: transparent;
-    background-color: #000000;
+    background-color: #0b0f14;
     color: #ffffff;
   }
 }
@@ -24,5 +24,5 @@
 .ios-blur {
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
-  background-color: rgba(28, 28, 30, 0.75);
+  background-color: rgba(17, 19, 24, 0.92);
 }
