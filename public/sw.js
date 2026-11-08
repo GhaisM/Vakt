@@ -1,5 +1,5 @@
 const CACHE_NAME = 'vakter-app-v1';
-const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/vakt-icon.svg'];
+const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/vakt-icon.svg', '/vakt-icon-192.png', '/vakt-icon-512.png'];
 
 self.addEventListener('install', event => {
   event.waitUntil(
