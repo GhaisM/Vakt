@@ -35,6 +35,8 @@ const calculateHours = (start: string, end: string) => {
   return hours;
 };
 
+const today = () => format(new Date(), 'yyyy-MM-dd');
+
 const formatCurrency = (val: number) => {
   return new Intl.NumberFormat('no-NO', { style: 'currency', currency: 'NOK', maximumFractionDigits: 0 }).format(val);
 };
@@ -116,7 +118,7 @@ export default function App() {
       </div>
 
       {/* CONTENT */}
-      <main className="w-full max-w-md px-4 py-6 flex-1 flex flex-col gap-6">
+      <main className="w-full max-w-md px-4 py-6 pb-32 flex-1 flex flex-col gap-6">
         {activeTab === 'dashboard' && <Dashboard data={currentData} />}
         {activeTab === 'vakter' && <VakterTab data={currentData} onUpdate={updateData} />}
         {activeTab === 'kalender' && <KalenderTab data={currentData} />}
@@ -124,7 +126,7 @@ export default function App() {
       </main>
 
       {/* BOTTOM TAB BAR */}
-      <div className="fixed bottom-0 left-0 right-0 ios-blur border-t border-[#2c2c2e] flex justify-center pb-8 pt-2 px-2">
+      <div className="fixed bottom-0 left-0 right-0 z-50 bg-[#111318]/95 backdrop-blur-xl border-t border-[#2c2c2e] flex justify-center pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-2 px-2">
         <nav className="w-full max-w-md flex justify-around">
           <TabButton icon={<Home />} label="Oversikt" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
           <TabButton icon={<Clock />} label="Vakter" active={activeTab === 'vakter'} onClick={() => setActiveTab('vakter')} />
@@ -154,7 +156,7 @@ function TabButton({ icon, label, active, onClick }: { icon: React.ReactNode, la
 
 // --- DASHBOARD COMPONENT ---
 function Dashboard({ data }: { data: AppData }) {
-  const iDagStr = new Date().toISOString().split('T')[0];
+  const iDagStr = today();
   const sortedShifts = [...data.shifts].sort((a,b) => new Date(a.dato).getTime() - new Date(b.dato).getTime());
   
   let nextShift = sortedShifts.find(s => s.status === 'Kommende' && s.dato >= iDagStr);
@@ -212,7 +214,7 @@ function Dashboard({ data }: { data: AppData }) {
       {/* All Time Highlight */}
       <div className="grid grid-cols-2 gap-4">
         <div className="bg-[#1c1c1e] rounded-3xl p-5 ios-shadow">
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Total Lønn i år</h3>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Total lønn</h3>
           <p className="text-2xl font-bold text-white tracking-tight">{formatCurrency(allTimeLonn)}</p>
         </div>
         <div className="bg-[#1c1c1e] rounded-3xl p-5 ios-shadow">
@@ -277,10 +279,10 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
 
   const [formData, setFormData] = useState({
     jobId: activeJobs[0]?.id || '',
-    dato: new Date().toISOString().split('T')[0],
-    start: '22:00',
-    slutt: '03:00',
-    status: 'Kommende' as 'Kommende' | 'Fullfort'
+    dato: today(),
+    start: '09:00',
+    slutt: '17:00',
+    status: 'Fullfort' as 'Kommende' | 'Fullfort'
   });
 
   const handleEditClick = (shift: Shift) => {
@@ -300,8 +302,7 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
     setErrorMsg(null);
     if (!formData.jobId) return setErrorMsg('Velg en jobb først!');
 
-    const tzOffset = new Date().getTimezoneOffset() * 60000;
-    const iDagStr = new Date(Date.now() - tzOffset).toISOString().split('T')[0];
+    const iDagStr = today();
 
     if (formData.status === 'Fullfort' && formData.dato > iDagStr) {
       return setErrorMsg("Feil: Du kan ikke logge en jobb som 'Fullført' hvis datoen er frem i tid!");
@@ -323,8 +324,8 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
       });
     }
     
-    // Reset but keep defaults (22:00 - 03:00)
-    setFormData(prev => ({ ...prev, start: '22:00', slutt: '03:00' }));
+    // Keep daytime defaults for the next entry.
+    setFormData(prev => ({ ...prev, start: '09:00', slutt: '17:00', status: 'Fullfort' }));
   };
 
   const handleDelete = (id: string) => {
@@ -335,8 +336,7 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
   const handleComplete = (id: string) => {
     const shift = data.shifts.find(s => s.id === id);
     if (!shift) return;
-    const tzOffset = new Date().getTimezoneOffset() * 60000;
-    const iDagStr = new Date(Date.now() - tzOffset).toISOString().split('T')[0];
+    const iDagStr = today();
     if (shift.dato > iDagStr) {
       return setErrorMsg("Du kan ikke godkjenne denne vakten ennå fordi datoen er i fremtiden.");
     }
@@ -406,8 +406,8 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
             <div className="mt-2">
               <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Status</label>
               <div className="flex gap-2 bg-[#000000] p-1 rounded-2xl border border-[#2c2c2e]">
-                <button type="button" onClick={() => setFormData({...formData, status: 'Kommende'})} className={`flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all ${formData.status === 'Kommende' ? 'bg-[#2c2c2e] shadow-sm text-white' : 'text-gray-500'}`}>Kommende</button>
-                <button type="button" onClick={() => setFormData({...formData, status: 'Fullfort'})} className={`flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all ${formData.status === 'Fullfort' ? 'bg-[#2c2c2e] shadow-sm text-white' : 'text-gray-500'}`}>Fullført</button>
+                <button type="button" onClick={() => setFormData({...formData, status: 'Kommende'})} className={`flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all ${formData.status === 'Kommende' ? 'bg-[#2c2c2e] shadow-sm text-white' : 'text-gray-500'}`}>Planlagt</button>
+                <button type="button" onClick={() => setFormData({...formData, status: 'Fullfort'})} className={`flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all ${formData.status === 'Fullfort' ? 'bg-[#2c2c2e] shadow-sm text-white' : 'text-gray-500'}`}>Jobbet</button>
               </div>
             </div>
 
