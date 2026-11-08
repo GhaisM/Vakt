@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Home, Calendar, Clock, Settings, Plus, Edit2, Trash2, CheckCircle2, ChevronLeft, ChevronRight, RotateCcw, RotateCw, AlertCircle } from 'lucide-react';
 import { format, parseISO, addMonths, subMonths, startOfMonth, endOfMonth, eachDayOfInterval, getDay, isToday } from 'date-fns';
 import { nb } from 'date-fns/locale';
@@ -24,6 +24,17 @@ interface Shift {
 interface AppData {
   jobs: Job[];
   shifts: Shift[];
+}
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
+
+interface LastShiftDefaults {
+  jobId?: string;
+  start?: string;
+  slutt?: string;
 }
 
 // --- UTILS ---
@@ -66,6 +77,37 @@ export default function App() {
   const [history, setHistory] = useState<AppData[]>([loadData()]);
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'vakter' | 'kalender' | 'innstillinger'>('dashboard');
+  const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [isInstalled, setIsInstalled] = useState(false);
+
+  useEffect(() => {
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+      || (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
+    setIsInstalled(isStandalone);
+
+    const handleBeforeInstall = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as BeforeInstallPromptEvent);
+    };
+    const handleInstalled = () => {
+      setIsInstalled(true);
+      setInstallPrompt(null);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
+
+  const installApp = async () => {
+    if (!installPrompt) return;
+    await installPrompt.prompt();
+    const result = await installPrompt.userChoice;
+    if (result.outcome === 'accepted') setInstallPrompt(null);
+  };
 
   const currentData = history[currentIndex];
 
@@ -119,10 +161,10 @@ export default function App() {
 
       {/* CONTENT */}
       <main className="w-full max-w-md px-4 py-6 pb-32 flex-1 flex flex-col gap-6">
-        {activeTab === 'dashboard' && <Dashboard data={currentData} />}
+        {activeTab === 'dashboard' && <Dashboard data={currentData} onOpenShiftLog={() => setActiveTab('vakter')} />}
         {activeTab === 'vakter' && <VakterTab data={currentData} onUpdate={updateData} />}
         {activeTab === 'kalender' && <KalenderTab data={currentData} />}
-        {activeTab === 'innstillinger' && <InnstillingerTab data={currentData} onUpdate={updateData} />}
+        {activeTab === 'innstillinger' && <InnstillingerTab data={currentData} onUpdate={updateData} installPromptAvailable={Boolean(installPrompt)} isInstalled={isInstalled} onInstall={installApp} />}
       </main>
 
       {/* BOTTOM TAB BAR */}
@@ -155,7 +197,7 @@ function TabButton({ icon, label, active, onClick }: { icon: React.ReactNode, la
 }
 
 // --- DASHBOARD COMPONENT ---
-function Dashboard({ data }: { data: AppData }) {
+function Dashboard({ data, onOpenShiftLog }: { data: AppData, onOpenShiftLog: () => void }) {
   const iDagStr = today();
   const sortedShifts = [...data.shifts].sort((a,b) => new Date(a.dato).getTime() - new Date(b.dato).getTime());
   
@@ -200,7 +242,13 @@ function Dashboard({ data }: { data: AppData }) {
 
   return (
     <div className="flex flex-col gap-5 animate-in fade-in slide-in-from-bottom-2 duration-300">
-      
+      <button
+        onClick={onOpenShiftLog}
+        className="w-full min-h-14 rounded-2xl bg-blue-600 hover:bg-blue-500 active:scale-[0.99] px-5 py-4 text-white font-bold text-base flex items-center justify-center gap-2 shadow-lg shadow-blue-950/30 transition"
+      >
+        <Plus size={20} strokeWidth={2.5} /> Logg vakt
+      </button>
+
       {/* Current Month Highlight */}
       <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow">
         <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Denne måneden</h2>
@@ -277,12 +325,21 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
   
   const activeJobs = data.jobs.filter(j => !j.deleted);
 
-  const [formData, setFormData] = useState({
-    jobId: activeJobs[0]?.id || '',
-    dato: today(),
-    start: '09:00',
-    slutt: '17:00',
-    status: 'Fullfort' as 'Kommende' | 'Fullfort'
+  const [formData, setFormData] = useState(() => {
+    let lastUsed: LastShiftDefaults = {};
+    try {
+      lastUsed = JSON.parse(localStorage.getItem('lastShiftDefaults') || '{}');
+    } catch {
+      lastUsed = {};
+    }
+    const rememberedJob = activeJobs.find(job => job.id === lastUsed.jobId);
+    return {
+      jobId: rememberedJob?.id || activeJobs[0]?.id || '',
+      dato: today(),
+      start: lastUsed.start || '09:00',
+      slutt: lastUsed.slutt || '17:00',
+      status: 'Fullfort' as 'Kommende' | 'Fullfort'
+    };
   });
 
   const handleEditClick = (shift: Shift) => {
@@ -309,6 +366,16 @@ function VakterTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) =
     }
     if (formData.status === 'Kommende' && formData.dato < iDagStr) {
       return setErrorMsg("Feil: Datoen er i fortiden. Sett status til 'Fullført'.");
+    }
+
+    try {
+      localStorage.setItem('lastShiftDefaults', JSON.stringify({
+        jobId: formData.jobId,
+        start: formData.start,
+        slutt: formData.slutt
+      }));
+    } catch {
+      // Keep the shift save usable even if browser storage is unavailable.
     }
 
     if (isEditing) {
@@ -536,7 +603,19 @@ function KalenderTab({ data }: { data: AppData }) {
 }
 
 // --- INNSTILLINGER TAB ---
-function InnstillingerTab({ data, onUpdate }: { data: AppData, onUpdate: (d: AppData) => void }) {
+function InnstillingerTab({
+  data,
+  onUpdate,
+  installPromptAvailable,
+  isInstalled,
+  onInstall
+}: {
+  data: AppData;
+  onUpdate: (d: AppData) => void;
+  installPromptAvailable: boolean;
+  isInstalled: boolean;
+  onInstall: () => void;
+}) {
   const [newJob, setNewJob] = useState({ navn: '', lonn: '', ferie: '10' });
   const [importStatus, setImportStatus] = useState<{ type: 'success'|'error', msg: string } | null>(null);
 
@@ -597,7 +676,32 @@ function InnstillingerTab({ data, onUpdate }: { data: AppData, onUpdate: (d: App
 
   return (
     <div className="flex flex-col gap-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
-      
+
+      <section className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow border border-[#2c2c2e]" aria-labelledby="install-app-heading">
+        <h2 id="install-app-heading" className="text-xl font-bold text-white mb-2">Bruk Vakter som app</h2>
+        <p className="text-sm text-gray-400 leading-relaxed">
+          Legg Vakter på hjemskjermen for rask tilgang. Vaktene lagres på denne enheten og kan brukes uten nett etter at appen er lastet ned én gang.
+        </p>
+        {isInstalled ? (
+          <p className="mt-4 rounded-xl bg-green-900/30 px-4 py-3 text-sm font-semibold text-green-300">Vakter er installert på denne enheten.</p>
+        ) : (
+          <>
+            {installPromptAvailable && (
+              <button onClick={onInstall} className="mt-4 w-full min-h-12 rounded-2xl bg-blue-600 px-4 py-3 font-bold text-white hover:bg-blue-500">
+                Installer Vakter
+              </button>
+            )}
+            <details className="mt-4 rounded-xl bg-[#2c2c2e] px-4 py-3">
+              <summary className="cursor-pointer text-sm font-semibold text-white">Slik legger du appen på hjemskjermen</summary>
+              <div className="mt-3 space-y-2 text-sm text-gray-300">
+                <p><strong>iPhone:</strong> Åpne siden i Safari, trykk Del og velg «Legg til på Hjem-skjerm».</p>
+                <p><strong>Android:</strong> Åpne nettlesermenyen og velg «Installer app» eller «Legg til på startskjermen».</p>
+              </div>
+            </details>
+          </>
+        )}
+      </section>
+
       {/* Active Jobs */}
       <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow">
         <h2 className="text-xl font-bold text-white mb-5 tracking-tight">Dine Jobber</h2>
