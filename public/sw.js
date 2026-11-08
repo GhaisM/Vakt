@@ -3,9 +3,18 @@ const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/vakt-icon.svg'
 
 self.addEventListener('install', event => {
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_NAME).then(async cache => {
+      await cache.addAll(APP_SHELL);
+      const indexResponse = await cache.match('/index.html');
+      if (indexResponse) {
+        const indexHtml = await indexResponse.text();
+        const foundAssets = [...indexHtml.matchAll(/(?:src|href)="([^"]+[.](?:js|css)(?:[?][^"]*)?)"/g)]
+          .map(match => match[1])
+          .filter(path => new URL(path, self.location.origin).origin === self.location.origin)
+          .map(path => new URL(path, self.location.origin).href);
+        if (foundAssets.length) await cache.addAll(foundAssets);
+      }
+    }).then(() => self.skipWaiting())
   );
 });
 
