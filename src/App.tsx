@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useEffect } from 'react';
-import { Home, Calendar, Clock, Settings, Plus, Edit2, Trash2, CheckCircle2, ChevronLeft, ChevronRight, RotateCcw, RotateCw, AlertCircle } from 'lucide-react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { Home, Calendar, Clock, Settings, Plus, Edit2, Trash2, CheckCircle2, ChevronLeft, ChevronRight, RotateCcw, RotateCw, AlertCircle, Copy } from 'lucide-react';
 import { format, parseISO, addMonths, subMonths, startOfMonth, endOfMonth, eachDayOfInterval, getDay, isToday } from 'date-fns';
 import { nb } from 'date-fns/locale';
 
@@ -19,6 +19,7 @@ interface Shift {
   start: string;
   slutt: string;
   status: 'Kommende' | 'Fullfort';
+  timelonn?: number;
   pauseMin?: number;
   tilleggNok?: number;
 }
@@ -65,8 +66,24 @@ const today = () => format(new Date(), 'yyyy-MM-dd');
 const calculatePaidHours = (shift: Pick<Shift, 'start' | 'slutt' | 'pauseMin'>) =>
   Math.max(0, calculateHours(shift.start, shift.slutt) - Math.max(0, Number(shift.pauseMin) || 0) / 60);
 
-const estimateShiftPay = (shift: Shift, job?: Job) =>
-  job ? calculatePaidHours(shift) * job.lonn + Math.max(0, Number(shift.tilleggNok) || 0) : 0;
+const isHourlyRate = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+const hourlyRateForShift = (shift: Pick<Shift, 'timelonn'>, job?: Job) =>
+  isHourlyRate(shift.timelonn) ? shift.timelonn : isHourlyRate(job?.lonn) ? job.lonn : undefined;
+
+const estimateShiftPay = (shift: Omit<Shift, 'id'>, job?: Job) => {
+  const rate = hourlyRateForShift(shift, job);
+  return rate === undefined ? 0 : calculatePaidHours(shift) * rate + Math.max(0, Number(shift.tilleggNok) || 0);
+};
+
+const withShiftRates = (data: AppData): AppData => ({
+  ...data,
+  shifts: data.shifts.map(shift => isHourlyRate(shift.timelonn) ? shift : {
+    ...shift,
+    timelonn: hourlyRateForShift(shift, data.jobs.find(job => job.id === shift.jobId))
+  })
+});
 
 const formatCurrency = (val: number) => {
   return new Intl.NumberFormat('no-NO', { style: 'currency', currency: 'NOK', maximumFractionDigits: 0 }).format(val);
@@ -86,7 +103,7 @@ const loadData = (): AppData => {
     jobs = jobs.map(j => ({ ...j, id: String(j.id) }));
     shifts = shifts.map(s => ({ ...s, id: String(s.id), jobId: String(s.jobId) }));
 
-    return { jobs, shifts };
+    return withShiftRates({ jobs, shifts });
   } catch (e) {
     return { jobs: [], shifts: [] };
   }
@@ -106,12 +123,25 @@ const loadRecoveryBackup = (): { savedAt: string; jobs: Job[]; shifts: Shift[] }
 
 export default function App() {
   // --- STATE: HISTORY & DATA ---
-  const [history, setHistory] = useState<AppData[]>([loadData()]);
+  const [history, setHistory] = useState<AppData[]>(() => [loadData()]);
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'vakter' | 'kalender' | 'innstillinger'>('dashboard');
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalled, setIsInstalled] = useState(false);
   const [dateForShiftLog, setDateForShiftLog] = useState<string | undefined>();
+  const [shiftEditor, setShiftEditor] = useState<{ shift?: Shift; date?: string } | null>(null);
+  const shiftEditorTrigger = useRef<HTMLElement | null>(null);
+
+  const openShiftEditor = (shift?: Shift, date?: string) => {
+    shiftEditorTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setShiftEditor({ shift, date });
+  };
+
+  useEffect(() => {
+    if (shiftEditor || !shiftEditorTrigger.current) return;
+    shiftEditorTrigger.current.focus();
+    shiftEditorTrigger.current = null;
+  }, [shiftEditor]);
 
   useEffect(() => {
     const isStandalone = window.matchMedia('(display-mode: standalone)').matches
@@ -163,6 +193,16 @@ export default function App() {
     localStorage.setItem('myShifts', JSON.stringify(newData.shifts));
   };
 
+  const saveShift = (shift: Omit<Shift, 'id'>, id?: string) => {
+    updateData({
+      ...currentData,
+      shifts: id
+        ? currentData.shifts.map(saved => saved.id === id ? { ...saved, ...shift } : saved)
+        : [{ ...shift, id: crypto.randomUUID() }, ...currentData.shifts]
+    });
+    setShiftEditor(null);
+  };
+
   const undo = () => {
     if (currentIndex > 0) {
       const newIndex = currentIndex - 1;
@@ -185,7 +225,7 @@ export default function App() {
     <div className="min-h-screen bg-black pb-24 font-sans flex flex-col items-center text-white">
       
       {/* HEADER (iOS Style) */}
-      <div className="sticky top-0 z-50 w-full max-w-md ios-blur border-b border-[#2c2c2e] px-4 py-3 flex justify-between items-center">
+      <div className={shiftEditor ? 'hidden' : "sticky top-0 z-50 w-full max-w-md ios-blur border-b border-[#2c2c2e] px-4 py-3 flex justify-between items-center"}>
         <h1 className="text-xl font-semibold tracking-tight text-white">
           {activeTab === 'dashboard' && 'Oversikt'}
           {activeTab === 'vakter' && 'Vakter & Logg'}
@@ -203,15 +243,32 @@ export default function App() {
       </div>
 
       {/* CONTENT */}
-      <main className="w-full max-w-md px-4 py-6 pb-32 flex-1 flex flex-col gap-6">
-        {activeTab === 'dashboard' && <Dashboard data={currentData} onOpenShiftLog={() => setActiveTab('vakter')} />}
-        {activeTab === 'vakter' && <VakterTab data={currentData} onUpdate={updateData} initialDate={dateForShiftLog} onInitialDateApplied={() => setDateForShiftLog(undefined)} />}
+      <main className={shiftEditor ? 'hidden' : "w-full max-w-md px-4 py-6 pb-32 flex-1 flex flex-col gap-6"}>
+        {activeTab === 'dashboard' && <Dashboard data={currentData} onLogShift={() => openShiftEditor()} />}
+        {activeTab === 'vakter' && <VakterTab data={currentData} onUpdate={updateData} onOpenEditor={openShiftEditor} initialDate={dateForShiftLog} onInitialDateApplied={() => setDateForShiftLog(undefined)} />}
         {activeTab === 'kalender' && <KalenderTab data={currentData} onOpenDate={(date) => { setDateForShiftLog(date); setActiveTab('vakter'); }} />}
         {activeTab === 'innstillinger' && <InnstillingerTab data={currentData} onUpdate={updateData} installPromptAvailable={Boolean(installPrompt)} isInstalled={isInstalled} onInstall={installApp} />}
       </main>
 
+      {shiftEditor && (
+        <main className="w-full max-w-md px-4 pt-4 pb-8">
+          <ShiftForm
+            data={currentData}
+            shift={shiftEditor.shift}
+            date={shiftEditor.date}
+            onSave={saveShift}
+            onCancel={() => setShiftEditor(null)}
+            onOpenJobs={() => {
+              shiftEditorTrigger.current = null;
+              setShiftEditor(null);
+              setActiveTab('innstillinger');
+            }}
+          />
+        </main>
+      )}
+
       {/* BOTTOM TAB BAR */}
-      <div className="fixed bottom-0 left-0 right-0 z-50 bg-[#111318]/95 backdrop-blur-xl border-t border-[#2c2c2e] flex justify-center pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-2 px-2">
+      <div className={shiftEditor ? 'hidden' : "fixed bottom-0 left-0 right-0 z-50 bg-[#111318]/95 backdrop-blur-xl border-t border-[#2c2c2e] flex justify-center pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-2 px-2"}>
         <nav className="w-full max-w-md flex justify-around">
           <TabButton icon={<Home />} label="Oversikt" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
           <TabButton icon={<Clock />} label="Vakter" active={activeTab === 'vakter'} onClick={() => setActiveTab('vakter')} />
@@ -242,7 +299,7 @@ function TabButton({ icon, label, active, onClick }: { icon: React.ReactNode, la
 }
 
 // --- DASHBOARD COMPONENT ---
-function Dashboard({ data, onOpenShiftLog }: { data: AppData, onOpenShiftLog: () => void }) {
+function Dashboard({ data, onLogShift }: { data: AppData, onLogShift: () => void }) {
   const iDagStr = today();
   const sortedShifts = [...data.shifts].sort((a,b) => new Date(a.dato).getTime() - new Date(b.dato).getTime());
   
@@ -263,13 +320,10 @@ function Dashboard({ data, onOpenShiftLog }: { data: AppData, onOpenShiftLog: ()
         };
       }
       const j = data.jobs.find(j => j.id === s.jobId);
-      if (j) {
-        const h = calculatePaidHours(s);
-        const brutto = estimateShiftPay(s, j);
-        stats[monthKey].totalLonn += brutto;
-        stats[monthKey].totalFerie += brutto * j.feriesats;
-        stats[monthKey].hours += h;
-      }
+      const brutto = estimateShiftPay(s, j);
+      stats[monthKey].totalLonn += brutto;
+      stats[monthKey].totalFerie += brutto * (j?.feriesats ?? 0);
+      stats[monthKey].hours += calculatePaidHours(s);
     });
 
     return Object.values(stats).sort((a, b) => b.monthDate.getTime() - a.monthDate.getTime());
@@ -288,7 +342,7 @@ function Dashboard({ data, onOpenShiftLog }: { data: AppData, onOpenShiftLog: ()
   return (
     <div className="flex flex-col gap-5 animate-in fade-in slide-in-from-bottom-2 duration-300">
       <button
-        onClick={onOpenShiftLog}
+        onClick={onLogShift}
         className="w-full min-h-14 rounded-2xl bg-blue-600 hover:bg-blue-500 active:scale-[0.99] px-5 py-4 text-white font-bold text-base flex items-center justify-center gap-2 shadow-lg shadow-blue-950/30 transition"
       >
         <Plus size={20} strokeWidth={2.5} /> Logg vakt
@@ -366,105 +420,185 @@ function Dashboard({ data, onOpenShiftLog }: { data: AppData, onOpenShiftLog: ()
   );
 }
 
-// --- VAKTER TAB (LIST + FORM) ---
-function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data: AppData, onUpdate: (d: AppData) => void, initialDate?: string, onInitialDateApplied: () => void }) {
-  const [isEditing, setIsEditing] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
-  const activeJobs = data.jobs.filter(j => !j.deleted);
+// --- VAKTSKJEMA ---
+function ShiftForm({ data, shift, date, onSave, onCancel, onOpenJobs }: {
+  data: AppData;
+  shift?: Shift;
+  date?: string;
+  onSave: (draft: Omit<Shift, 'id'>, id?: string) => void;
+  onCancel: () => void;
+  onOpenJobs: () => void;
+}) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const [error, setError] = useState('');
+  const availableJobs = data.jobs.filter(job => !job.deleted || job.id === shift?.jobId);
+  const [draft, setDraft] = useState(() => {
+    let lastUsed: LastShiftDefaults = {};
+    try {
+      lastUsed = JSON.parse(localStorage.getItem('lastShiftDefaults') || '{}') ?? {};
+    } catch {
+      // The form can start with its built-in defaults.
+    }
+    const job = availableJobs.find(item => item.id === (shift?.jobId ?? lastUsed.jobId)) ?? availableJobs[0];
+    const initialDate = shift?.dato ?? date ?? today();
+    const rate = shift ? hourlyRateForShift(shift, data.jobs.find(item => item.id === shift.jobId)) : job?.lonn;
+    return {
+      jobId: shift?.jobId ?? job?.id ?? '',
+      dato: initialDate,
+      start: shift?.start ?? lastUsed.start ?? '09:00',
+      slutt: shift?.slutt ?? lastUsed.slutt ?? '17:00',
+      pauseMin: Math.max(0, Number(shift ? shift.pauseMin : lastUsed.pauseMin) || 0),
+      tilleggNok: Math.max(0, Number(shift ? shift.tilleggNok : lastUsed.tilleggNok) || 0),
+      status: shift?.status ?? (initialDate > today() ? 'Kommende' : 'Fullfort'),
+      timelonn: rate === undefined ? '' : String(rate)
+    };
+  });
 
+  useEffect(() => {
+    window.scrollTo(0, 0);
+    headingRef.current?.focus();
+  }, []);
+
+  const previousShift = !shift
+    ? data.shifts
+        .filter(item => item.status === 'Fullfort' && availableJobs.some(job => job.id === item.jobId))
+        .sort((a, b) => b.dato.localeCompare(a.dato) || b.start.localeCompare(a.start))[0]
+    : undefined;
+
+  const copyPreviousShift = () => {
+    if (!previousShift) return;
+    const job = availableJobs.find(item => item.id === previousShift.jobId);
+    setDraft(current => ({
+      ...current,
+      jobId: previousShift.jobId,
+      start: previousShift.start,
+      slutt: previousShift.slutt,
+      pauseMin: previousShift.pauseMin ?? 0,
+      tilleggNok: previousShift.tilleggNok ?? 0,
+      timelonn: job ? String(job.lonn) : ''
+    }));
+    setError('');
+  };
+
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const rate = Number(draft.timelonn);
+    if (!draft.jobId) return setError('Velg en jobb.');
+    if (draft.timelonn === '' || !isHourlyRate(rate)) return setError('Skriv inn en gyldig timelønn.');
+    if (draft.pauseMin > calculateHours(draft.start, draft.slutt) * 60) {
+      return setError('Pausen kan ikke være lengre enn vakten.');
+    }
+    if (draft.status === 'Fullfort' && draft.dato > today()) {
+      return setError('Velg «Planlagt» for en vakt i fremtiden.');
+    }
+    if (draft.status === 'Kommende' && draft.dato < today()) {
+      return setError('Velg «Jobbet» for en vakt som har vært.');
+    }
+
+    onSave({ ...draft, timelonn: rate }, shift?.id);
+    try {
+      const { jobId, start, slutt, pauseMin, tilleggNok } = draft;
+      localStorage.setItem('lastShiftDefaults', JSON.stringify({ jobId, start, slutt, pauseMin, tilleggNok }));
+    } catch {
+      // Remembering the last values is optional.
+    }
+  };
+
+  const field = 'min-w-0 w-full rounded-xl bg-[#2c2c2e] px-3 py-3 text-base text-white [color-scheme:dark]';
+  const label = 'flex min-w-0 flex-col gap-1.5 text-sm font-medium text-gray-300';
+  const selectedJob = availableJobs.find(job => job.id === draft.jobId);
+  const hasEstimate = draft.start && draft.slutt && draft.timelonn !== '' && isHourlyRate(Number(draft.timelonn));
+
+  return (
+    <section className="rounded-3xl border border-[#2c2c2e] bg-[#1c1c1e] p-4 sm:p-6" aria-labelledby="shift-form-heading">
+      <header className="mb-5 flex items-center justify-between gap-3">
+        <h1 id="shift-form-heading" ref={headingRef} tabIndex={-1} className="text-xl font-bold">
+          {shift ? 'Rediger vakt' : 'Logg vakt'}
+        </h1>
+        <button type="button" onClick={onCancel} className="min-h-11 rounded-xl px-3 text-sm font-semibold text-blue-300">Avbryt</button>
+      </header>
+      {availableJobs.length === 0 && !shift ? (
+        <div className="space-y-3 rounded-xl bg-orange-900/30 p-4 text-sm text-orange-300">
+          <p>Legg til en jobb før du logger en vakt.</p>
+          <button type="button" onClick={onOpenJobs} className="min-h-11 font-semibold underline">Gå til innstillinger</button>
+        </div>
+      ) : (
+        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          {previousShift && (
+            <button type="button" onClick={copyPreviousShift} className="flex min-h-11 items-center justify-center gap-2 rounded-xl bg-[#2c2c2e] px-3 py-2 text-sm font-semibold text-blue-300">
+              <Copy size={16} /> Kopier forrige vakt
+            </button>
+          )}
+          <label className={label}>
+            Jobb
+            <select value={draft.jobId} onChange={event => {
+              const jobId = event.target.value;
+              const job = availableJobs.find(item => item.id === jobId);
+              setDraft(current => ({ ...current, jobId, timelonn: job ? String(job.lonn) : '' }));
+            }} className={field} required>
+              {!selectedJob && <option value={draft.jobId}>Ukjent jobb</option>}
+              {availableJobs.map(job => <option key={job.id} value={job.id}>{job.navn}{job.deleted ? ' (arkivert)' : ''}</option>)}
+            </select>
+          </label>
+          <label className={label}>
+            Dato
+            <input type="date" value={draft.dato} onChange={event => setDraft({ ...draft, dato: event.target.value })} required className={field} />
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className={label}>Start<input type="time" value={draft.start} onChange={event => setDraft({ ...draft, start: event.target.value })} required className={field} /></label>
+            <label className={label}>Slutt<input type="time" value={draft.slutt} onChange={event => setDraft({ ...draft, slutt: event.target.value })} required className={field} /></label>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <label className={label}>Pause (min)<input type="number" min="0" step="1" inputMode="numeric" value={draft.pauseMin} onChange={event => setDraft({ ...draft, pauseMin: Number(event.target.value) })} className={field} /></label>
+            <label className={label}>Tillegg (kr)<input type="number" min="0" step="0.01" inputMode="decimal" value={draft.tilleggNok} onChange={event => setDraft({ ...draft, tilleggNok: Number(event.target.value) })} className={field} /></label>
+          </div>
+          <label className={label}>
+            Timelønn for vakten (kr)
+            <input type="number" min="0" step="0.01" inputMode="decimal" value={draft.timelonn} onChange={event => setDraft({ ...draft, timelonn: event.target.value })} required className={field} />
+          </label>
+          {hasEstimate && (
+            <p className="rounded-xl bg-blue-950/40 p-3 text-sm font-semibold text-blue-100">
+              Estimert lønn før skatt: {formatCurrency(estimateShiftPay({ ...draft, timelonn: Number(draft.timelonn) }))}
+            </p>
+          )}
+          <fieldset>
+            <legend className="mb-2 text-sm font-medium text-gray-300">Status</legend>
+            <div className="flex gap-2">
+              {(['Fullfort', 'Kommende'] as const).map(status => (
+                <button key={status} type="button" aria-pressed={draft.status === status} onClick={() => setDraft({ ...draft, status })} className="min-h-11 flex-1 rounded-xl bg-[#2c2c2e] px-3 text-sm font-semibold text-gray-300 aria-pressed:bg-blue-950 aria-pressed:text-blue-100">
+                  {status === 'Fullfort' ? 'Jobbet' : 'Planlagt'}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+          {error && <p role="alert" className="rounded-xl bg-red-900/30 p-3 text-sm text-red-300">{error}</p>}
+          <button type="submit" className="min-h-12 rounded-xl bg-blue-600 px-4 py-3 font-bold text-white hover:bg-blue-500">
+            {shift ? 'Lagre endringer' : 'Lagre vakt'}
+          </button>
+        </form>
+      )}
+    </section>
+  );
+}
+
+// --- VAKTLOGG ---
+function VakterTab({ data, onUpdate, onOpenEditor, initialDate, onInitialDateApplied }: {
+  data: AppData;
+  onUpdate: (data: AppData) => void;
+  onOpenEditor: (shift?: Shift, date?: string) => void;
+  initialDate?: string;
+  onInitialDateApplied: () => void;
+}) {
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [filterTerm, setFilterTerm] = useState('');
   const [filterJob, setFilterJob] = useState('all');
   const [filterStatus, setFilterStatus] = useState('all');
   const [filterMonth, setFilterMonth] = useState('all');
   const [filterDate, setFilterDate] = useState(initialDate || 'all');
 
-  const [formData, setFormData] = useState(() => {
-    let lastUsed: LastShiftDefaults = {};
-    try {
-      lastUsed = JSON.parse(localStorage.getItem('lastShiftDefaults') || '{}');
-    } catch {
-      lastUsed = {};
-    }
-    const rememberedJob = activeJobs.find(job => job.id === lastUsed.jobId);
-    return {
-      jobId: rememberedJob?.id || activeJobs[0]?.id || '',
-      dato: initialDate || today(),
-      start: lastUsed.start || '09:00',
-      slutt: lastUsed.slutt || '17:00',
-      pauseMin: Math.max(0, Number(lastUsed.pauseMin) || 0),
-      tilleggNok: Math.max(0, Number(lastUsed.tilleggNok) || 0),
-      status: 'Fullfort' as 'Kommende' | 'Fullfort'
-    };
-  });
-
   useEffect(() => {
     if (initialDate) onInitialDateApplied();
   }, [initialDate, onInitialDateApplied]);
-
-  const handleEditClick = (shift: Shift) => {
-    setIsEditing(shift.id);
-    setFormData({
-      jobId: shift.jobId,
-      dato: shift.dato,
-      start: shift.start,
-      slutt: shift.slutt,
-      pauseMin: Math.max(0, Number(shift.pauseMin) || 0),
-      tilleggNok: Math.max(0, Number(shift.tilleggNok) || 0),
-      status: shift.status
-    });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMsg(null);
-    if (!formData.jobId) return setErrorMsg('Velg en jobb først!');
-
-    const iDagStr = today();
-
-    if (Number(formData.pauseMin) < 0 || Number(formData.tilleggNok) < 0) {
-      return setErrorMsg('Pause og tillegg kan ikke være negative.');
-    }
-    if (Number(formData.pauseMin) > calculateHours(formData.start, formData.slutt) * 60) {
-      return setErrorMsg('Pausen kan ikke være lengre enn vakten.');
-    }
-
-    if (formData.status === 'Fullfort' && formData.dato > iDagStr) {
-      return setErrorMsg("Feil: Du kan ikke logge en jobb som 'Fullført' hvis datoen er frem i tid!");
-    }
-    if (formData.status === 'Kommende' && formData.dato < iDagStr) {
-      return setErrorMsg("Feil: Datoen er i fortiden. Sett status til 'Fullført'.");
-    }
-
-    try {
-      localStorage.setItem('lastShiftDefaults', JSON.stringify({
-        jobId: formData.jobId,
-        start: formData.start,
-        slutt: formData.slutt,
-        pauseMin: Number(formData.pauseMin) || 0,
-        tilleggNok: Number(formData.tilleggNok) || 0
-      }));
-    } catch {
-      // Keep the shift save usable even if browser storage is unavailable.
-    }
-
-    if (isEditing) {
-      onUpdate({
-        ...data,
-        shifts: data.shifts.map(s => s.id === isEditing ? { ...s, ...formData } : s)
-      });
-      setIsEditing(null);
-    } else {
-      onUpdate({
-        ...data,
-        shifts: [{ id: Date.now().toString(), ...formData }, ...data.shifts]
-      });
-    }
-    
-    // Keep daytime defaults for the next entry.
-    setFormData(prev => ({ ...prev, dato: today(), status: 'Fullfort' }));
-  };
 
   const handleDelete = (id: string) => {
     if (!window.confirm('Vil du slette denne vakten?')) return;
@@ -509,7 +643,7 @@ function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data
   };
   const exportFilteredCsv = () => {
     const rows = [
-      ['Dato', 'Jobb', 'Status', 'Start', 'Slutt', 'Ubetalt pause (min)', 'Timer jobbet', 'Lønn (estimat)', 'Feriepenger (estimat)'],
+      ['Dato', 'Jobb', 'Status', 'Start', 'Slutt', 'Ubetalt pause (min)', 'Timer jobbet', 'Timelønn', 'Lønn (estimat)', 'Feriepenger (estimat)'],
       ...visibleShifts.map(shift => {
         const job = data.jobs.find(item => item.id === shift.jobId);
         const pay = estimateShiftPay(shift, job);
@@ -521,6 +655,7 @@ function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data
           shift.slutt,
           String(shift.pauseMin || 0),
           calculatePaidHours(shift).toFixed(2),
+          hourlyRateForShift(shift, job)?.toFixed(2) ?? '',
           pay.toFixed(2),
           (pay * (job?.feriesats || 0)).toFixed(2)
         ];
@@ -538,87 +673,10 @@ function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data
   return (
     <div className="flex flex-col gap-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
       
-      {/* VAKT FORM */}
-      <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow border border-[#2c2c2e]">
-        <h2 className="text-xl font-bold text-white mb-5 flex justify-between items-center tracking-tight">
-          <span>{isEditing ? 'Rediger vakt' : 'Ny Vakt'}</span>
-          {isEditing && (
-             <button onClick={() => setIsEditing(null)} className="text-sm text-blue-500 font-semibold px-3 py-1 bg-[#2c2c2e] rounded-full">Avbryt</button>
-          )}
-        </h2>
-        
-        {activeJobs.length === 0 ? (
-          <div className="bg-orange-900/30 text-orange-400 p-4 rounded-xl text-sm flex gap-2 border border-orange-500/20">
-            <AlertCircle size={20} className="shrink-0" />
-            Du må legge til en jobb (under Innstillinger) før du kan logge vakter.
-          </div>
-        ) : (
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-            {errorMsg && (
-              <div className="bg-red-900/30 text-red-400 p-3 rounded-xl text-sm flex items-center justify-between border border-red-500/20">
-                <div className="flex gap-2 items-center">
-                  <AlertCircle size={18} className="shrink-0" />
-                  <span>{errorMsg}</span>
-                </div>
-                <button type="button" onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-300 ml-2">✕</button>
-              </div>
-            )}
-            <div>
-              <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Jobb</label>
-              <select 
-                value={formData.jobId} onChange={e => setFormData({...formData, jobId: e.target.value})}
-                className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none"
-              >
-                {activeJobs.map(j => <option key={j.id} value={j.id}>{j.navn}</option>)}
-              </select>
-            </div>
-            
-            <div>
-              <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Dato</label>
-              <input type="date" value={formData.dato} onChange={e => setFormData({...formData, dato: e.target.value})} required className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500 [color-scheme:dark]" />
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Start</label>
-                <input type="time" value={formData.start} onChange={e => setFormData({...formData, start: e.target.value})} required className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500 [color-scheme:dark]" />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Slutt</label>
-                <input type="time" value={formData.slutt} onChange={e => setFormData({...formData, slutt: e.target.value})} required className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500 [color-scheme:dark]" />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Ubetalt pause (min)</label>
-                <input type="number" min="0" step="5" inputMode="numeric" value={formData.pauseMin} onChange={e => setFormData({...formData, pauseMin: Number(e.target.value)})} className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500" />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Tillegg denne vakten (kr)</label>
-                <input type="number" min="0" step="1" inputMode="decimal" value={formData.tilleggNok} onChange={e => setFormData({...formData, tilleggNok: Number(e.target.value)})} className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500" />
-              </div>
-            </div>
-
-            <div className="rounded-2xl bg-blue-950/40 border border-blue-900/50 p-4 text-sm">
-              <p className="font-semibold text-blue-100">Lønnsestimat: {formatCurrency(Math.max(0, calculateHours(formData.start, formData.slutt) - Math.max(0, Number(formData.pauseMin) || 0) / 60) * (activeJobs.find(job => job.id === formData.jobId)?.lonn || 0) + Math.max(0, Number(formData.tilleggNok) || 0))}</p>
-              <p className="mt-1 text-xs leading-relaxed text-blue-200/70">Bruk timelønn, ubetalt pause og tillegg fra arbeidsavtalen din. Appen legger ikke inn tariff- eller helgetillegg automatisk.</p>
-            </div>
-
-            <div className="mt-2">
-              <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Status</label>
-              <div className="flex gap-2 bg-[#000000] p-1 rounded-2xl border border-[#2c2c2e]">
-                <button type="button" aria-pressed={formData.status === 'Kommende'} onClick={() => setFormData({...formData, status: 'Kommende'})} className={`flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all ${formData.status === 'Kommende' ? 'bg-[#2c2c2e] shadow-sm text-white' : 'text-gray-500'}`}>Planlagt</button>
-                <button type="button" aria-pressed={formData.status === 'Fullfort'} onClick={() => setFormData({...formData, status: 'Fullfort'})} className={`flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all ${formData.status === 'Fullfort' ? 'bg-[#2c2c2e] shadow-sm text-white' : 'text-gray-500'}`}>Jobbet</button>
-              </div>
-            </div>
-
-            <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold text-lg py-4 rounded-2xl mt-4 transition-colors active:scale-[0.98]">
-              {isEditing ? 'Lagre Endringer' : 'Legg Til Vakt'}
-            </button>
-          </form>
-        )}
-      </div>
+      <button type="button" onClick={() => onOpenEditor(undefined, filterDate === 'all' ? undefined : filterDate)} className="flex min-h-12 items-center justify-center gap-2 rounded-2xl bg-blue-600 px-4 py-3 font-bold text-white hover:bg-blue-500">
+        <Plus size={20} /> Logg vakt
+      </button>
+      {errorMsg && <p role="alert" className="rounded-xl bg-red-900/30 p-3 text-sm text-red-300">{errorMsg}</p>}
 
       {/* VAKT LISTE */}
       <section className="bg-[#1c1c1e] rounded-3xl p-5 ios-shadow border border-[#2c2c2e]">
@@ -683,6 +741,7 @@ function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data
             const job = data.jobs.find(j => j.id === s.jobId);
             const hours = calculatePaidHours(s);
             const pay = estimateShiftPay(s, job);
+            const rate = hourlyRateForShift(s, job);
             return (
               <article key={s.id} className="bg-[#1c1c1e] rounded-3xl p-5 ios-shadow flex flex-col gap-4 border border-[#2c2c2e]">
                 <div className="flex justify-between items-start gap-3">
@@ -704,6 +763,7 @@ function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data
                     <span className="text-gray-300">Lønn, estimat</span>
                     <span className="font-bold text-white">{formatCurrency(pay)}</span>
                   </div>
+                  {rate !== undefined && <p className="mt-1 text-xs text-gray-400">Timelønn: {rate.toLocaleString('nb-NO')} kr/t</p>}
                   {Number(s.tilleggNok) > 0 && <p className="mt-1 text-right text-xs text-gray-400">Inkl. {formatCurrency(Number(s.tilleggNok))} tillegg</p>}
                 </div>
                 <div className="flex flex-wrap justify-end gap-2">
@@ -712,7 +772,7 @@ function VakterTab({ data, onUpdate, initialDate, onInitialDateApplied }: { data
                       <CheckCircle2 size={16} strokeWidth={2.5} /> Ferdig
                     </button>
                   )}
-                  <button onClick={() => handleEditClick(s)} className="min-h-11 flex items-center gap-1.5 px-4 py-2 bg-[#2c2c2e] text-blue-300 hover:bg-[#38383a] rounded-xl text-sm font-bold transition-colors">
+                  <button onClick={() => onOpenEditor(s)} className="min-h-11 flex items-center gap-1.5 px-4 py-2 bg-[#2c2c2e] text-blue-300 hover:bg-[#38383a] rounded-xl text-sm font-bold transition-colors">
                     <Edit2 size={16} strokeWidth={2.5} /> Endre
                   </button>
                   <button onClick={() => handleDelete(s.id)} className="min-h-11 flex items-center gap-1.5 px-4 py-2 bg-[#2c2c2e] text-red-300 hover:bg-[#38383a] rounded-xl text-sm font-bold transition-colors">
@@ -850,6 +910,20 @@ function InnstillingerTab({
 }) {
   const [newJob, setNewJob] = useState({ navn: '', lonn: '', ferie: '10' });
   const [jobError, setJobError] = useState<string | null>(null);
+  const [rateEdit, setRateEdit] = useState<{ jobId: string; value: string } | null>(null);
+
+  const saveJobRate = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!rateEdit) return;
+    const rate = Number(rateEdit.value);
+    if (!isHourlyRate(rate) || rate <= 0) return;
+    const snapshot = withShiftRates(data);
+    onUpdate({
+      ...snapshot,
+      jobs: snapshot.jobs.map(job => job.id === rateEdit.jobId ? { ...job, lonn: rate } : job)
+    });
+    setRateEdit(null);
+  };
   const [importStatus, setImportStatus] = useState<{ type: 'success'|'error', msg: string } | null>(null);
   const [autoBackup, setAutoBackup] = useState(loadRecoveryBackup);
 
@@ -912,7 +986,7 @@ function InnstillingerTab({
           pauseMin: Math.max(0, Number(shift.pauseMin) || 0),
           tilleggNok: Math.max(0, Number(shift.tilleggNok) || 0)
         }));
-        onUpdate({ jobs: normalizedJobs, shifts: normalizedShifts });
+        onUpdate(withShiftRates({ jobs: normalizedJobs, shifts: normalizedShifts }));
         setAutoBackup({
           savedAt: new Date().toISOString(),
           jobs: data.jobs,
@@ -931,7 +1005,7 @@ function InnstillingerTab({
   const handleRestoreAutoBackup = () => {
     if (!autoBackup) return;
     if (!window.confirm('Gjenopprette forrige automatiske sikkerhetskopi? Dette bytter ut den nåværende vaktlisten.')) return;
-    onUpdate({ jobs: autoBackup.jobs, shifts: autoBackup.shifts });
+    onUpdate(withShiftRates({ jobs: autoBackup.jobs, shifts: autoBackup.shifts }));
     setImportStatus({ type: 'success', msg: 'Forrige sikkerhetskopi er gjenopprettet.' });
   };
 
@@ -1002,14 +1076,34 @@ function InnstillingerTab({
         ) : (
           <div className="flex flex-col gap-3 mb-6">
             {activeJobs.map(j => (
-              <div key={j.id} className="flex justify-between items-center bg-[#2c2c2e] p-4 rounded-2xl">
-                <div>
-                  <h3 className="font-bold text-white text-lg">{j.navn}</h3>
-                  <p className="text-sm text-gray-400 font-medium mt-0.5">{j.lonn} kr/t • {j.feriesats * 100}% feriepenger</p>
+              <div key={j.id} className="rounded-2xl bg-[#2c2c2e] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-lg font-bold text-white">{j.navn}</h3>
+                    <p className="mt-0.5 text-sm text-gray-400">{j.lonn} kr/t • {j.feriesats * 100}% feriepenger</p>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button type="button" onClick={() => setRateEdit({ jobId: j.id, value: String(j.lonn) })} className="min-h-11 rounded-xl px-2 text-sm font-semibold text-blue-300">
+                      Endre timelønn
+                    </button>
+                    <button type="button" onClick={() => handleDeleteJob(j.id)} aria-label={'Arkiver ' + j.navn} className="min-h-11 min-w-11 rounded-xl p-3 text-red-300 hover:bg-[#38383a]">
+                      <Trash2 size={20} />
+                    </button>
+                  </div>
                 </div>
-                <button onClick={() => handleDeleteJob(j.id)} aria-label={`Arkiver ${j.navn}`} className="min-h-11 min-w-11 p-3 text-red-300 hover:bg-[#38383a] rounded-xl transition-colors">
-                  <Trash2 size={20} />
-                </button>
+                {rateEdit?.jobId === j.id && (
+                  <form onSubmit={saveJobRate} className="mt-4 flex flex-col gap-3 border-t border-white/10 pt-4">
+                    <label className="flex flex-col gap-2 text-sm text-gray-300">
+                      Ny timelønn for {j.navn} (kr)
+                      <input type="number" inputMode="decimal" min="0.01" step="0.01" required value={rateEdit.value} onChange={event => setRateEdit({ jobId: j.id, value: event.target.value })} className="w-full rounded-xl bg-[#1c1c1e] px-3 py-2.5 text-base text-white" />
+                    </label>
+                    <p className="text-xs text-gray-400">Den nye satsen foreslås på vakter du registrerer heretter.</p>
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <button type="button" onClick={() => setRateEdit(null)} className="min-h-11 rounded-xl px-3 text-sm text-blue-300">Avbryt</button>
+                      <button type="submit" className="min-h-11 rounded-xl bg-blue-600 px-3 text-sm font-semibold text-white">Lagre timelønn</button>
+                    </div>
+                  </form>
+                )}
               </div>
             ))}
           </div>
@@ -1025,7 +1119,7 @@ function InnstillingerTab({
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Timelønn</label>
-              <input type="number" step="0.5" value={newJob.lonn} onChange={e => setNewJob({...newJob, lonn: e.target.value})} required placeholder="190" className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              <input type="number" min="0.01" step="0.01" value={newJob.lonn} onChange={e => setNewJob({...newJob, lonn: e.target.value})} required placeholder="190" className="w-full bg-[#2c2c2e] border border-transparent rounded-2xl px-4 py-3.5 text-base font-medium text-white focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
             <div>
               <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Ferie (%)</label>
