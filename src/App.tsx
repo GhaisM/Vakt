@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Home, Calendar, Clock, Settings, Plus, Edit2, Trash2, CheckCircle2, ChevronLeft, ChevronRight, RotateCcw, RotateCw, AlertCircle, Copy } from 'lucide-react';
-import { format, parseISO, addMonths, subMonths, startOfMonth, endOfMonth, eachDayOfInterval, getDay, isToday } from 'date-fns';
+import { format, parseISO, addMonths, subMonths, startOfMonth, endOfMonth, eachDayOfInterval, getDay, isToday, isValid } from 'date-fns';
 import { nb } from 'date-fns/locale';
 
 // --- TYPES ---
@@ -30,10 +30,10 @@ interface AppData {
   monthReviews?: Record<string, string>;
 }
 
-interface BackupFile extends AppData {
-  format?: string;
-  version?: number;
-  exportedAt?: string;
+interface BackupPreview {
+  data: AppData;
+  name: string;
+  savedAt?: string;
 }
 
 interface BeforeInstallPromptEvent extends Event {
@@ -51,6 +51,9 @@ interface LastShiftDefaults {
 
 const AUTO_BACKUP_KEY = 'myVaktbokRecovery';
 const MONTH_REVIEWS_KEY = 'myVaktbokMonthReviews';
+const APP_DATA_KEY = 'myVaktbokData';
+const LAST_EXPORT_KEY = 'myVaktbokLastExport';
+const BACKUP_FORMAT = 'min-vaktbok-backup';
 
 // --- UTILS ---
 const clockMinutes = (time: string) => {
@@ -131,15 +134,90 @@ const loadMonthReviews = () => {
   }
 };
 
-const storeData = (data: AppData) => {
-  localStorage.setItem('myJobs', JSON.stringify(data.jobs));
-  localStorage.setItem('myShifts', JSON.stringify(data.shifts));
-  localStorage.setItem(MONTH_REVIEWS_KEY, JSON.stringify(data.monthReviews ?? {}));
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const validId = (value: unknown): value is string | number =>
+  (typeof value === 'string' && value.trim() !== '') || (typeof value === 'number' && Number.isFinite(value));
+
+const backupNumber = (value: unknown) =>
+  typeof value === 'number' || (typeof value === 'string' && value.trim() !== '') ? Number(value) : NaN;
+
+const validBackupDate = (value: unknown): value is string =>
+  typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && isValid(parseISO(value));
+
+const validBackupTime = (value: unknown): value is string =>
+  typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+
+const backupTimestamp = (value: unknown) =>
+  typeof value === 'string' && isValid(parseISO(value)) ? value : undefined;
+
+const decodeLegacyBackupList = (value: unknown) => typeof value === 'string' ? JSON.parse(value) : value ?? [];
+
+const parseBackup = (value: unknown): AppData => {
+  if (!isRecord(value) || (value.format !== undefined && value.format !== BACKUP_FORMAT)) {
+    throw new Error('Velg en sikkerhetskopi fra Vakter.');
+  }
+  if (value.version !== undefined && value.version !== 1) {
+    throw new Error('Denne sikkerhetskopien er laget med en annen versjon av Vakter.');
+  }
+  const legacy = !('jobs' in value || 'shifts' in value) && 'myJobs' in value && 'myShifts' in value;
+  const rawJobs = legacy ? decodeLegacyBackupList(value.myJobs) : value.jobs;
+  const rawShifts = legacy ? decodeLegacyBackupList(value.myShifts) : value.shifts;
+  if (!Array.isArray(rawJobs) || !Array.isArray(rawShifts)) {
+    throw new Error('Sikkerhetskopien må inneholde både jobber og vakter.');
+  }
+
+  const jobs: Job[] = rawJobs.map(job => {
+    if (!isRecord(job) || !validId(job.id) || typeof job.navn !== 'string') {
+      throw new Error('Sikkerhetskopien inneholder en ugyldig jobb.');
+    }
+    const lonn = backupNumber(job.lonn);
+    const feriesats = backupNumber(job.feriesats);
+    if (!isHourlyRate(lonn) || !isHourlyRate(feriesats)) {
+      throw new Error('En jobb i sikkerhetskopien har ugyldige lønnssatser.');
+    }
+    return { id: String(job.id), navn: job.navn, lonn, feriesats, deleted: job.deleted === true };
+  });
+
+  const shifts: Shift[] = rawShifts.map(shift => {
+    if (!isRecord(shift) || !validId(shift.id) || !validId(shift.jobId)
+      || !validBackupDate(shift.dato) || !validBackupTime(shift.start) || !validBackupTime(shift.slutt)
+      || (shift.status !== 'Kommende' && shift.status !== 'Fullfort')) {
+      throw new Error('En vakt i sikkerhetskopien har ugyldig dato, tid eller status.');
+    }
+    const pauseMin = backupNumber(shift.pauseMin ?? 0);
+    const tilleggNok = backupNumber(shift.tilleggNok ?? 0);
+    const timelonn = shift.timelonn == null ? undefined : backupNumber(shift.timelonn);
+    if (!isHourlyRate(pauseMin) || !isHourlyRate(tilleggNok) || (timelonn !== undefined && !isHourlyRate(timelonn))) {
+      throw new Error('En vakt i sikkerhetskopien har ugyldig pause, tillegg eller timelønn.');
+    }
+    return {
+      id: String(shift.id), jobId: String(shift.jobId), dato: shift.dato, start: shift.start,
+      slutt: shift.slutt, status: shift.status, pauseMin, tilleggNok, timelonn
+    };
+  });
+
+  if (new Set(jobs.map(job => job.id)).size !== jobs.length || new Set(shifts.map(shift => shift.id)).size !== shifts.length) {
+    throw new Error('Sikkerhetskopien inneholder doble registreringer.');
+  }
+  return withShiftRates({ jobs, shifts, monthReviews: normalizeMonthReviews(value.monthReviews) });
+};
+
+const storeData = (data: AppData, previous: AppData) => {
+  const recovery = { savedAt: new Date().toISOString(), ...previous };
+  // Save the active data and recovery copy together so a failed write changes neither.
+  localStorage.setItem(APP_DATA_KEY, JSON.stringify({ data, recovery }));
 };
 
 // --- INITIAL DATA LOAD ---
 const loadData = (): AppData => {
   try {
+    const stored = localStorage.getItem(APP_DATA_KEY);
+    if (stored) {
+      const { data } = JSON.parse(stored) as { data: AppData };
+      return withShiftRates({ ...data, monthReviews: normalizeMonthReviews(data.monthReviews) });
+    }
     const savedJobs = localStorage.getItem('myJobs');
     const savedShifts = localStorage.getItem('myShifts');
     
@@ -157,15 +235,24 @@ const loadData = (): AppData => {
   }
 };
 
-const loadRecoveryBackup = (): (AppData & { savedAt: string }) | null => {
+const loadRecoveryBackup = (): BackupPreview | null => {
   try {
-    const value = localStorage.getItem(AUTO_BACKUP_KEY);
-    if (!value) return null;
-    const backup = JSON.parse(value);
-    if (typeof backup.savedAt !== 'string' || !Array.isArray(backup.jobs) || !Array.isArray(backup.shifts)) return null;
-    return { ...backup, monthReviews: normalizeMonthReviews(backup.monthReviews) };
+    const stored = localStorage.getItem(APP_DATA_KEY);
+    const backup: unknown = stored
+      ? JSON.parse(stored).recovery
+      : JSON.parse(localStorage.getItem(AUTO_BACKUP_KEY) ?? 'null');
+    if (!isRecord(backup)) return null;
+    return { data: parseBackup(backup), name: 'Forrige automatiske kopi', savedAt: backupTimestamp(backup.savedAt) };
   } catch {
     return null;
+  }
+};
+
+const loadLastExport = () => {
+  try {
+    return backupTimestamp(localStorage.getItem(LAST_EXPORT_KEY));
+  } catch {
+    return undefined;
   }
 };
 
@@ -173,6 +260,7 @@ export default function App() {
   // --- STATE: HISTORY & DATA ---
   const [history, setHistory] = useState<AppData[]>(() => [loadData()]);
   const [currentIndex, setCurrentIndex] = useState<number>(0);
+  const [storageError, setStorageError] = useState(false);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'vakter' | 'kalender' | 'innstillinger'>('dashboard');
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalled, setIsInstalled] = useState(false);
@@ -222,46 +310,48 @@ export default function App() {
 
   const currentData = history[currentIndex];
 
-  const updateData = (newData: AppData) => {
+  const persistData = (newData: AppData) => {
     try {
-      localStorage.setItem(AUTO_BACKUP_KEY, JSON.stringify({
-        version: 1,
-        savedAt: new Date().toISOString(),
-        ...currentData
-      }));
+      storeData(newData, currentData);
+      setStorageError(false);
+      return true;
     } catch {
-      // Keep normal editing available if browser storage is full.
+      setStorageError(true);
+      return false;
     }
+  };
+
+  const updateData = (newData: AppData) => {
+    if (!persistData(newData)) return false;
     const newHistory = history.slice(0, currentIndex + 1);
     newHistory.push(newData);
     setHistory(newHistory);
     setCurrentIndex(newHistory.length - 1);
-    storeData(newData);
+    return true;
   };
 
   const saveShift = (shift: Omit<Shift, 'id'>, id?: string) => {
-    updateData({
+    const saved = updateData({
       ...currentData,
       shifts: id
         ? currentData.shifts.map(saved => saved.id === id ? { ...saved, ...shift } : saved)
         : [{ ...shift, id: crypto.randomUUID() }, ...currentData.shifts]
     });
-    setShiftEditor(null);
+    if (saved) setShiftEditor(null);
+    return saved;
   };
 
   const undo = () => {
     if (currentIndex > 0) {
       const newIndex = currentIndex - 1;
-      setCurrentIndex(newIndex);
-      storeData(history[newIndex]);
+      if (persistData(history[newIndex])) setCurrentIndex(newIndex);
     }
   };
 
   const redo = () => {
     if (currentIndex < history.length - 1) {
       const newIndex = currentIndex + 1;
-      setCurrentIndex(newIndex);
-      storeData(history[newIndex]);
+      if (persistData(history[newIndex])) setCurrentIndex(newIndex);
     }
   };
 
@@ -288,6 +378,7 @@ export default function App() {
 
       {/* CONTENT */}
       <main className={shiftEditor ? 'hidden' : "w-full max-w-md px-4 py-6 pb-32 flex-1 flex flex-col gap-6"}>
+        {storageError && !shiftEditor && <p role="alert" className="rounded-xl bg-red-900/30 p-3 text-sm text-red-300">Endringen kunne ikke lagres på denne enheten.</p>}
         {activeTab === 'dashboard' && <Dashboard data={currentData} onLogShift={() => openShiftEditor()} onUpdate={updateData} />}
         {activeTab === 'vakter' && <VakterTab data={currentData} onUpdate={updateData} onOpenEditor={openShiftEditor} initialDate={dateForShiftLog} onInitialDateApplied={() => setDateForShiftLog(undefined)} />}
         {activeTab === 'kalender' && <KalenderTab data={currentData} onOpenDate={(date) => { setDateForShiftLog(date); setActiveTab('vakter'); }} />}
@@ -579,7 +670,7 @@ function ShiftForm({ data, shift, date, onSave, onCancel, onOpenJobs }: {
   data: AppData;
   shift?: Shift;
   date?: string;
-  onSave: (draft: Omit<Shift, 'id'>, id?: string) => void;
+  onSave: (draft: Omit<Shift, 'id'>, id?: string) => boolean;
   onCancel: () => void;
   onOpenJobs: () => void;
 }) {
@@ -656,7 +747,9 @@ function ShiftForm({ data, shift, date, onSave, onCancel, onOpenJobs }: {
       return setError('Velg «Jobbet» for en vakt som har vært.');
     }
 
-    onSave({ ...draft, timelonn: rate }, shift?.id);
+    if (!onSave({ ...draft, timelonn: rate }, shift?.id)) {
+      return setError('Vakten kunne ikke lagres på denne enheten. Prøv igjen.');
+    }
     try {
       const { jobId, start, slutt, pauseMin, tilleggNok } = draft;
       localStorage.setItem('lastShiftDefaults', JSON.stringify({ jobId, start, slutt, pauseMin, tilleggNok }));
@@ -1083,7 +1176,7 @@ function InnstillingerTab({
   onInstall
 }: {
   data: AppData;
-  onUpdate: (d: AppData) => void;
+  onUpdate: (d: AppData) => boolean;
   installPromptAvailable: boolean;
   isInstalled: boolean;
   onInstall: () => void;
@@ -1098,98 +1191,77 @@ function InnstillingerTab({
     const rate = Number(rateEdit.value);
     if (!isHourlyRate(rate) || rate <= 0) return;
     const snapshot = withShiftRates(data);
-    onUpdate({
+    if (onUpdate({
       ...snapshot,
       jobs: snapshot.jobs.map(job => job.id === rateEdit.jobId ? { ...job, lonn: rate } : job)
-    });
-    setRateEdit(null);
+    })) setRateEdit(null);
   };
   const [importStatus, setImportStatus] = useState<{ type: 'success'|'error', msg: string } | null>(null);
-  const [autoBackup, setAutoBackup] = useState(loadRecoveryBackup);
-
+  const [pendingBackup, setPendingBackup] = useState<BackupPreview | null>(null);
+  const [lastExport, setLastExport] = useState(loadLastExport);
+  const [readingBackup, setReadingBackup] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const previewHeading = useRef<HTMLHeadingElement>(null);
+  const autoBackup = useMemo(loadRecoveryBackup, [data]);
   const activeJobs = data.jobs.filter(j => !j.deleted);
 
   useEffect(() => {
-    setAutoBackup(loadRecoveryBackup());
-  }, [data]);
+    if (pendingBackup) previewHeading.current?.focus();
+  }, [pendingBackup]);
 
   const handleExport = () => {
+    const exportedAt = new Date().toISOString();
     const backupData = {
-      format: 'min-vaktbok-backup',
+      format: BACKUP_FORMAT,
       version: 1,
-      exportedAt: new Date().toISOString(),
+      exportedAt,
       ...data
     };
     const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'min_vaktbok_backup.json';
+    a.download = 'vakter-sikkerhetskopi-' + today() + '.json';
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    setLastExport(exportedAt);
+    try {
+      localStorage.setItem(LAST_EXPORT_KEY, exportedAt);
+    } catch {
+      // The downloaded file remains available even if the date cannot be stored.
+    }
   };
 
-  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
+    setReadingBackup(true);
+    setPendingBackup(null);
     setImportStatus(null);
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const importedData = JSON.parse(event.target?.result as string) as Partial<BackupFile> & { myJobs?: string | Job[]; myShifts?: string | Shift[] };
-        const decode = (value: string | Job[] | Shift[] | undefined) =>
-          typeof value === 'string' ? JSON.parse(value) : value;
-        const jobs = (importedData.jobs || decode(importedData.myJobs) || []) as Job[];
-        const shifts = (importedData.shifts || decode(importedData.myShifts) || []) as Shift[];
-        const validJobs = Array.isArray(jobs) && jobs.every(job =>
-          job && job.id !== undefined && typeof job.navn === 'string' && Number.isFinite(Number(job.lonn)) && Number.isFinite(Number(job.feriesats))
-        );
-        const validShifts = Array.isArray(shifts) && shifts.every(shift =>
-          shift && shift.id !== undefined && shift.jobId !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(shift.dato)
-          && /^\d{2}:\d{2}$/.test(shift.start) && /^\d{2}:\d{2}$/.test(shift.slutt)
-          && (shift.status === 'Kommende' || shift.status === 'Fullfort')
-        );
-        if (!validJobs || !validShifts) throw new Error('Backupfilen inneholder data i et ukjent format.');
-        if (!window.confirm('Importen erstatter vaktlisten og jobbene på denne enheten. Fortsette?')) return;
-
-        const normalizedJobs: Job[] = jobs.map(job => ({
-          ...job,
-          id: String(job.id),
-          lonn: Number(job.lonn),
-          feriesats: Number(job.feriesats)
-        }));
-        const normalizedShifts: Shift[] = shifts.map(shift => ({
-          ...shift,
-          id: String(shift.id),
-          jobId: String(shift.jobId),
-          pauseMin: Math.max(0, Number(shift.pauseMin) || 0),
-          tilleggNok: Math.max(0, Number(shift.tilleggNok) || 0)
-        }));
-        onUpdate(withShiftRates({
-          jobs: normalizedJobs,
-          shifts: normalizedShifts,
-          monthReviews: normalizeMonthReviews(importedData.monthReviews)
-        }));
-        setAutoBackup({
-          savedAt: new Date().toISOString(),
-          ...data
-        });
-        setImportStatus({ type: 'success', msg: 'Sikkerhetskopien er importert.' });
-      } catch {
-        setImportStatus({ type: 'error', msg: 'Filen kunne ikke leses. Velg en Vakter-sikkerhetskopi i JSON-format.' });
-      } finally {
-        e.target.value = '';
-      }
-    };
-    reader.readAsText(file);
+    try {
+      const parsed: unknown = JSON.parse((await file.text()).replace(/^\uFEFF/, ''));
+      const backupData = parseBackup(parsed);
+      const savedAt = isRecord(parsed) ? backupTimestamp(parsed.exportedAt) : undefined;
+      setPendingBackup({ data: backupData, name: file.name, savedAt });
+    } catch (error) {
+      const msg = error instanceof Error && !(error instanceof SyntaxError || error instanceof DOMException)
+        ? error.message
+        : 'Filen kunne ikke leses. Velg en JSON-fil eksportert fra Vakter.';
+      setImportStatus({ type: 'error', msg });
+    } finally {
+      setReadingBackup(false);
+    }
   };
 
-  const handleRestoreAutoBackup = () => {
-    if (!autoBackup) return;
-    if (!window.confirm('Gjenopprette forrige automatiske sikkerhetskopi? Dette bytter ut den nåværende vaktlisten.')) return;
-    const { jobs, shifts, monthReviews } = autoBackup;
-    onUpdate(withShiftRates({ jobs, shifts, monthReviews }));
-    setImportStatus({ type: 'success', msg: 'Forrige sikkerhetskopi er gjenopprettet.' });
+  const restoreBackup = () => {
+    if (!pendingBackup) return;
+    if (!onUpdate(pendingBackup.data)) {
+      setImportStatus({ type: 'error', msg: 'Gjenoppretting kunne ikke lagres på denne enheten.' });
+      return;
+    }
+    setPendingBackup(null);
+    setImportStatus({ type: 'success', msg: 'Sikkerhetskopien er gjenopprettet. Du kan finne dataene du hadde før, i den automatiske kopien.' });
   };
 
   const handleAddJob = (e: React.FormEvent) => {
@@ -1211,8 +1283,7 @@ function InnstillingerTab({
       lonn: hourlyRate,
       feriesats: holidayRate / 100
     };
-    onUpdate({ ...data, jobs: [...data.jobs, job] });
-    setNewJob({ navn: '', lonn: '', ferie: '10' });
+    if (onUpdate({ ...data, jobs: [...data.jobs, job] })) setNewJob({ navn: '', lonn: '', ferie: '10' });
   };
 
   const handleDeleteJob = (id: string) => {
@@ -1317,28 +1388,44 @@ function InnstillingerTab({
 
       <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow">
         <h2 className="text-xl font-bold text-white mb-2 tracking-tight">Sikkerhetskopi</h2>
-        <p className="mb-5 text-sm leading-relaxed text-gray-400">Vaktdata lagres på denne enheten og synkroniseres ikke automatisk. Eksporter en kopi før du bytter telefon eller nettleser.</p>
+        <p className="mb-5 text-sm leading-relaxed text-gray-400">Skal du bytte telefon? Last ned kopien, ta med filen til den nye telefonen og åpne «Mer» → «Sikkerhetskopi» for å velge den.</p>
         
         {importStatus && (
-          <div className={`p-4 rounded-xl text-sm font-medium mb-4 flex gap-2 items-center ${importStatus.type === 'success' ? 'bg-green-900/30 text-green-400 border border-green-500/20' : 'bg-red-900/30 text-red-400 border border-red-500/20'}`}>
+          <div role={importStatus.type === 'error' ? 'alert' : 'status'} className={`p-4 rounded-xl text-sm font-medium mb-4 flex gap-2 items-center ${importStatus.type === 'success' ? 'bg-green-900/30 text-green-400 border border-green-500/20' : 'bg-red-900/30 text-red-400 border border-red-500/20'}`}>
             <AlertCircle size={18} className="shrink-0" />
             {importStatus.msg}
           </div>
         )}
 
         <div className="flex flex-col gap-3">
-          <button onClick={handleExport} className="w-full min-h-12 bg-[#2c2c2e] text-white font-bold py-4 rounded-2xl transition-colors hover:bg-[#38383a] active:scale-[0.98]">
-            💾 Last ned sikkerhetskopi
+          <p className="text-sm text-gray-300" aria-live="polite">
+            {lastExport ? 'Siste eksport: ' + format(parseISO(lastExport), 'd. MMM yyyy HH:mm', { locale: nb }) : 'Ingen eksport registrert på denne enheten.'}
+          </p>
+          <button type="button" onClick={handleExport} className="w-full min-h-12 bg-[#2c2c2e] text-white font-bold py-4 rounded-2xl transition-colors hover:bg-[#38383a] active:scale-[0.98]">
+            Last ned sikkerhetskopi
           </button>
-          <label className="w-full min-h-12 bg-[#2c2c2e] text-white font-bold py-4 rounded-2xl transition-colors hover:bg-[#38383a] active:scale-[0.98] text-center cursor-pointer block">
-            📂 Gjenopprett fra fil
-            <input type="file" accept=".json,application/json" onChange={handleImport} className="hidden" />
-          </label>
+          <input ref={fileInput} type="file" accept=".json,application/json" onChange={handleImport} className="hidden" />
+          <button type="button" disabled={readingBackup} onClick={() => fileInput.current?.click()} className="w-full min-h-12 bg-[#2c2c2e] text-white font-bold py-4 rounded-2xl transition-colors hover:bg-[#38383a] disabled:opacity-50">
+            {readingBackup ? 'Leser sikkerhetskopi …' : 'Velg sikkerhetskopi fra fil'}
+          </button>
+          {pendingBackup && (
+            <section className="rounded-2xl border border-blue-500/30 bg-blue-950/30 p-4" aria-labelledby="backup-preview-heading">
+              <h3 id="backup-preview-heading" ref={previewHeading} tabIndex={-1} className="font-semibold">Forhåndsvis sikkerhetskopi</h3>
+              <p className="mt-2 break-all text-sm text-gray-300">{pendingBackup.name}</p>
+              {pendingBackup.savedAt && <p className="mt-1 text-sm text-gray-400">Laget {format(parseISO(pendingBackup.savedAt), 'd. MMM yyyy HH:mm', { locale: nb })}</p>}
+              <p className="mt-2 text-sm font-semibold">{pendingBackup.data.shifts.length} {pendingBackup.data.shifts.length === 1 ? 'vakt' : 'vakter'} · {pendingBackup.data.jobs.length} {pendingBackup.data.jobs.length === 1 ? 'jobb' : 'jobber'}</p>
+              <p className="mt-2 text-sm text-gray-300">Gjenoppretting erstatter vakter, jobber og avkrysninger på denne enheten. Det du har lagret nå, beholdes i den automatiske kopien.</p>
+              <div className="mt-3 flex flex-wrap justify-end gap-2">
+                <button type="button" onClick={() => { setPendingBackup(null); setImportStatus(null); }} className="min-h-11 rounded-xl px-3 text-sm font-semibold text-blue-300">Avbryt</button>
+                <button type="button" onClick={restoreBackup} className="min-h-11 rounded-xl bg-blue-600 px-3 text-sm font-semibold text-white">Erstatt data og gjenopprett</button>
+              </div>
+            </section>
+          )}
           {autoBackup && (
             <div className="rounded-2xl border border-[#2c2c2e] p-4">
               <p className="text-sm text-gray-300">En tidligere versjon lagres automatisk før du endrer vakter eller jobber.</p>
-              <p className="mt-1 text-xs text-gray-500">Sist lagret: {format(parseISO(autoBackup.savedAt), 'd. MMM yyyy HH:mm', { locale: nb })}</p>
-              <button type="button" onClick={handleRestoreAutoBackup} className="mt-3 min-h-11 w-full rounded-xl bg-[#2c2c2e] px-4 py-3 text-sm font-bold text-blue-300">Gjenopprett forrige versjon</button>
+              {autoBackup.savedAt && <p className="mt-1 text-xs text-gray-400">Sist lagret: {format(parseISO(autoBackup.savedAt), 'd. MMM yyyy HH:mm', { locale: nb })}</p>}
+              <button type="button" disabled={readingBackup} onClick={() => { setImportStatus(null); setPendingBackup(autoBackup); }} className="mt-3 min-h-11 w-full rounded-xl bg-[#2c2c2e] px-4 py-3 text-sm font-bold text-blue-300 disabled:opacity-50">Se forrige automatiske kopi</button>
             </div>
           )}
         </div>
