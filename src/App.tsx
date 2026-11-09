@@ -27,14 +27,13 @@ interface Shift {
 interface AppData {
   jobs: Job[];
   shifts: Shift[];
+  monthReviews?: Record<string, string>;
 }
 
-interface BackupFile {
+interface BackupFile extends AppData {
   format?: string;
   version?: number;
   exportedAt?: string;
-  jobs: Job[];
-  shifts: Shift[];
 }
 
 interface BeforeInstallPromptEvent extends Event {
@@ -51,20 +50,48 @@ interface LastShiftDefaults {
 }
 
 const AUTO_BACKUP_KEY = 'myVaktbokRecovery';
+const MONTH_REVIEWS_KEY = 'myVaktbokMonthReviews';
 
 // --- UTILS ---
-const calculateHours = (start: string, end: string) => {
-  const [sh, sm] = start.split(':').map(Number);
-  const [eh, em] = end.split(':').map(Number);
-  let hours = (eh + em / 60) - (sh + sm / 60);
-  if (hours < 0) hours += 24; // Crosses midnight
-  return hours;
+const clockMinutes = (time: string) => {
+  const [hours, minutes] = time.split(':').map(Number);
+  return hours * 60 + minutes;
+};
+
+type ShiftTimes = Pick<Shift, 'dato' | 'start' | 'slutt'>;
+const minutesPerDay = 24 * 60;
+const crossesMidnight = ({ start, slutt }: Pick<ShiftTimes, 'start' | 'slutt'>) =>
+  clockMinutes(slutt) < clockMinutes(start);
+
+const shiftDurationMinutes = (start: string, slutt: string) =>
+  clockMinutes(slutt) - clockMinutes(start) + (crossesMidnight({ start, slutt }) ? minutesPerDay : 0);
+
+const shiftInterval = ({ dato, start, slutt }: ShiftTimes) => {
+  // Use calendar days and wall clock times, as in the shift form.
+  const begins = Date.parse(dato + 'T00:00:00Z') / 60_000 + clockMinutes(start);
+  return { begins, ends: begins + shiftDurationMinutes(start, slutt) };
+};
+
+const findOverlappingShifts = (draft: ShiftTimes, shifts: Shift[], editedId?: string) => {
+  const { begins, ends } = shiftInterval(draft);
+  if (!(begins < ends)) return [];
+
+  return shifts.filter(shift => {
+    if (shift.id === editedId) return false;
+    const other = shiftInterval(shift);
+    return other.begins < other.ends && begins < other.ends && other.begins < ends;
+  });
 };
 
 const today = () => format(new Date(), 'yyyy-MM-dd');
 
-const calculatePaidHours = (shift: Pick<Shift, 'start' | 'slutt' | 'pauseMin'>) =>
-  Math.max(0, calculateHours(shift.start, shift.slutt) - Math.max(0, Number(shift.pauseMin) || 0) / 60);
+const unpaidPauseMinutes = (shift: Pick<Shift, 'pauseMin'>) => Math.max(0, Number(shift.pauseMin) || 0);
+const shiftSupplement = (shift: Pick<Shift, 'tilleggNok'>) => Math.max(0, Number(shift.tilleggNok) || 0);
+
+const paidMinutes = (shift: Pick<Shift, 'start' | 'slutt' | 'pauseMin'>) =>
+  Math.max(0, shiftDurationMinutes(shift.start, shift.slutt) - unpaidPauseMinutes(shift));
+
+const calculatePaidHours = (shift: Pick<Shift, 'start' | 'slutt' | 'pauseMin'>) => paidMinutes(shift) / 60;
 
 const isHourlyRate = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -74,7 +101,7 @@ const hourlyRateForShift = (shift: Pick<Shift, 'timelonn'>, job?: Job) =>
 
 const estimateShiftPay = (shift: Omit<Shift, 'id'>, job?: Job) => {
   const rate = hourlyRateForShift(shift, job);
-  return rate === undefined ? 0 : calculatePaidHours(shift) * rate + Math.max(0, Number(shift.tilleggNok) || 0);
+  return rate === undefined ? 0 : calculatePaidHours(shift) * rate + shiftSupplement(shift);
 };
 
 const withShiftRates = (data: AppData): AppData => ({
@@ -85,8 +112,29 @@ const withShiftRates = (data: AppData): AppData => ({
   })
 });
 
-const formatCurrency = (val: number) => {
-  return new Intl.NumberFormat('no-NO', { style: 'currency', currency: 'NOK', maximumFractionDigits: 0 }).format(val);
+const formatCurrency = (val: number, maximumFractionDigits = 0) => {
+  return new Intl.NumberFormat('no-NO', { style: 'currency', currency: 'NOK', maximumFractionDigits }).format(val);
+};
+
+const normalizeMonthReviews = (value: unknown): Record<string, string> => {
+  if (!value || typeof value !== 'object') return {};
+  return Object.fromEntries(Object.entries(value).filter(
+    (entry): entry is [string, string] => /^\d{4}-(0[1-9]|1[0-2])$/.test(entry[0]) && typeof entry[1] === 'string'
+  ));
+};
+
+const loadMonthReviews = () => {
+  try {
+    return normalizeMonthReviews(JSON.parse(localStorage.getItem(MONTH_REVIEWS_KEY) ?? '{}'));
+  } catch {
+    return {};
+  }
+};
+
+const storeData = (data: AppData) => {
+  localStorage.setItem('myJobs', JSON.stringify(data.jobs));
+  localStorage.setItem('myShifts', JSON.stringify(data.shifts));
+  localStorage.setItem(MONTH_REVIEWS_KEY, JSON.stringify(data.monthReviews ?? {}));
 };
 
 // --- INITIAL DATA LOAD ---
@@ -103,19 +151,19 @@ const loadData = (): AppData => {
     jobs = jobs.map(j => ({ ...j, id: String(j.id) }));
     shifts = shifts.map(s => ({ ...s, id: String(s.id), jobId: String(s.jobId) }));
 
-    return withShiftRates({ jobs, shifts });
+    return withShiftRates({ jobs, shifts, monthReviews: loadMonthReviews() });
   } catch (e) {
     return { jobs: [], shifts: [] };
   }
 };
 
-const loadRecoveryBackup = (): { savedAt: string; jobs: Job[]; shifts: Shift[] } | null => {
+const loadRecoveryBackup = (): (AppData & { savedAt: string }) | null => {
   try {
     const value = localStorage.getItem(AUTO_BACKUP_KEY);
     if (!value) return null;
     const backup = JSON.parse(value);
     if (typeof backup.savedAt !== 'string' || !Array.isArray(backup.jobs) || !Array.isArray(backup.shifts)) return null;
-    return backup;
+    return { ...backup, monthReviews: normalizeMonthReviews(backup.monthReviews) };
   } catch {
     return null;
   }
@@ -179,8 +227,7 @@ export default function App() {
       localStorage.setItem(AUTO_BACKUP_KEY, JSON.stringify({
         version: 1,
         savedAt: new Date().toISOString(),
-        jobs: currentData.jobs,
-        shifts: currentData.shifts
+        ...currentData
       }));
     } catch {
       // Keep normal editing available if browser storage is full.
@@ -189,8 +236,7 @@ export default function App() {
     newHistory.push(newData);
     setHistory(newHistory);
     setCurrentIndex(newHistory.length - 1);
-    localStorage.setItem('myJobs', JSON.stringify(newData.jobs));
-    localStorage.setItem('myShifts', JSON.stringify(newData.shifts));
+    storeData(newData);
   };
 
   const saveShift = (shift: Omit<Shift, 'id'>, id?: string) => {
@@ -207,8 +253,7 @@ export default function App() {
     if (currentIndex > 0) {
       const newIndex = currentIndex - 1;
       setCurrentIndex(newIndex);
-      localStorage.setItem('myJobs', JSON.stringify(history[newIndex].jobs));
-      localStorage.setItem('myShifts', JSON.stringify(history[newIndex].shifts));
+      storeData(history[newIndex]);
     }
   };
 
@@ -216,8 +261,7 @@ export default function App() {
     if (currentIndex < history.length - 1) {
       const newIndex = currentIndex + 1;
       setCurrentIndex(newIndex);
-      localStorage.setItem('myJobs', JSON.stringify(history[newIndex].jobs));
-      localStorage.setItem('myShifts', JSON.stringify(history[newIndex].shifts));
+      storeData(history[newIndex]);
     }
   };
 
@@ -244,7 +288,7 @@ export default function App() {
 
       {/* CONTENT */}
       <main className={shiftEditor ? 'hidden' : "w-full max-w-md px-4 py-6 pb-32 flex-1 flex flex-col gap-6"}>
-        {activeTab === 'dashboard' && <Dashboard data={currentData} onLogShift={() => openShiftEditor()} />}
+        {activeTab === 'dashboard' && <Dashboard data={currentData} onLogShift={() => openShiftEditor()} onUpdate={updateData} />}
         {activeTab === 'vakter' && <VakterTab data={currentData} onUpdate={updateData} onOpenEditor={openShiftEditor} initialDate={dateForShiftLog} onInitialDateApplied={() => setDateForShiftLog(undefined)} />}
         {activeTab === 'kalender' && <KalenderTab data={currentData} onOpenDate={(date) => { setDateForShiftLog(date); setActiveTab('vakter'); }} />}
         {activeTab === 'innstillinger' && <InnstillingerTab data={currentData} onUpdate={updateData} installPromptAvailable={Boolean(installPrompt)} isInstalled={isInstalled} onInstall={installApp} />}
@@ -298,46 +342,71 @@ function TabButton({ icon, label, active, onClick }: { icon: React.ReactNode, la
   );
 }
 
+interface WorkTotals {
+  count: number;
+  paid: number;
+  pause: number;
+  supplements: number;
+  gross: number;
+  holidayPay: number;
+}
+
+const emptyWorkTotals = (): WorkTotals => ({ count: 0, paid: 0, pause: 0, supplements: 0, gross: 0, holidayPay: 0 });
+
+const addWorkTotals = (total: WorkTotals, entry: WorkTotals) => {
+  total.count += entry.count;
+  total.paid += entry.paid;
+  total.pause += entry.pause;
+  total.supplements += entry.supplements;
+  total.gross += entry.gross;
+  total.holidayPay += entry.holidayPay;
+};
+
+const buildMonthlyReports = (shifts: Shift[], jobs: Map<string, Job>) => {
+  const months = new Map<string, { total: WorkTotals; byJob: Map<string, WorkTotals> }>();
+
+  for (const shift of shifts) {
+    if (shift.status !== 'Fullfort') continue;
+    const monthKey = shift.dato.slice(0, 7);
+    const month = months.get(monthKey) ?? { total: emptyWorkTotals(), byJob: new Map<string, WorkTotals>() };
+    const job = jobs.get(shift.jobId);
+    const gross = estimateShiftPay(shift, job);
+    const entry = {
+      count: 1,
+      paid: paidMinutes(shift),
+      pause: unpaidPauseMinutes(shift),
+      supplements: shiftSupplement(shift),
+      gross,
+      holidayPay: gross * (job?.feriesats ?? 0)
+    };
+    const jobTotal = month.byJob.get(shift.jobId) ?? emptyWorkTotals();
+
+    addWorkTotals(jobTotal, entry);
+    addWorkTotals(month.total, entry);
+    month.byJob.set(shift.jobId, jobTotal);
+    months.set(monthKey, month);
+  }
+
+  return months;
+};
+
 // --- DASHBOARD COMPONENT ---
-function Dashboard({ data, onLogShift }: { data: AppData, onLogShift: () => void }) {
+function Dashboard({ data, onLogShift, onUpdate }: {
+  data: AppData;
+  onLogShift: () => void;
+  onUpdate: (data: AppData) => void;
+}) {
   const iDagStr = today();
-  const sortedShifts = [...data.shifts].sort((a,b) => new Date(a.dato).getTime() - new Date(b.dato).getTime());
-  
-  let nextShift = sortedShifts.find(s => s.status === 'Kommende' && s.dato >= iDagStr);
-  
-  // Calculate stats per month
-  const monthlyStats = useMemo(() => {
-    const stats: Record<string, { monthDate: Date, totalLonn: number, totalFerie: number, hours: number }> = {};
+  const currentMonthKey = iDagStr.slice(0, 7);
+  const jobs = useMemo(() => new Map(data.jobs.map(job => [job.id, job])), [data.jobs]);
+  const months = useMemo(() => buildMonthlyReports(data.shifts, jobs), [data.shifts, jobs]);
+  const currentMonthData = months.get(currentMonthKey)?.total ?? emptyWorkTotals();
+  const allTime = emptyWorkTotals();
+  months.forEach(month => addWorkTotals(allTime, month.total));
 
-    sortedShifts.filter(s => s.status === 'Fullfort').forEach(s => {
-      const monthKey = s.dato.substring(0, 7); // "YYYY-MM"
-      if (!stats[monthKey]) {
-        stats[monthKey] = {
-          monthDate: parseISO(`${monthKey}-01`),
-          totalLonn: 0,
-          totalFerie: 0,
-          hours: 0
-        };
-      }
-      const j = data.jobs.find(j => j.id === s.jobId);
-      const brutto = estimateShiftPay(s, j);
-      stats[monthKey].totalLonn += brutto;
-      stats[monthKey].totalFerie += brutto * (j?.feriesats ?? 0);
-      stats[monthKey].hours += calculatePaidHours(s);
-    });
-
-    return Object.values(stats).sort((a, b) => b.monthDate.getTime() - a.monthDate.getTime());
-  }, [sortedShifts, data.jobs]);
-
-  const currentMonthKey = iDagStr.substring(0, 7);
-  const currentMonthData = monthlyStats.find(s => format(s.monthDate, 'yyyy-MM') === currentMonthKey) || { totalLonn: 0, totalFerie: 0, hours: 0 };
-
-  let allTimeLonn = 0;
-  let allTimeFerie = 0;
-  monthlyStats.forEach(m => {
-    allTimeLonn += m.totalLonn;
-    allTimeFerie += m.totalFerie;
-  });
+  const nextShift = data.shifts
+    .filter(shift => shift.status === 'Kommende' && shift.dato >= iDagStr)
+    .sort((a, b) => a.dato.localeCompare(b.dato) || a.start.localeCompare(b.start))[0];
 
   return (
     <div className="flex flex-col gap-5 animate-in fade-in slide-in-from-bottom-2 duration-300">
@@ -351,23 +420,26 @@ function Dashboard({ data, onLogShift }: { data: AppData, onLogShift: () => void
       {/* Current Month Highlight */}
       <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow">
         <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Lønn denne måneden · estimat</h2>
-        <div className="text-5xl font-bold text-white mb-2 tracking-tight">{formatCurrency(currentMonthData.totalLonn)}</div>
+        <div className="text-5xl font-bold text-white mb-2 tracking-tight">{formatCurrency(currentMonthData.gross)}</div>
         <p className="text-sm text-gray-500 font-medium">
-          Registrert arbeid på {currentMonthData.hours.toFixed(1)} timer 
-          <span className="text-blue-300 ml-2">+{formatCurrency(currentMonthData.totalFerie)} i feriepenger (estimat)</span>
+          Registrert arbeid på {(currentMonthData.paid / 60).toFixed(1)} timer
+          <span className="text-blue-300 ml-2">+{formatCurrency(currentMonthData.holidayPay)} i feriepenger (estimat)</span>
         </p>
+        <a href="#maanedsrapport" className="mt-2 inline-flex min-h-11 items-center rounded-lg text-sm font-semibold text-blue-300 underline underline-offset-4">
+          Se månedsrapport
+        </a>
       </div>
 
       {/* All Time Highlight */}
       <div className="grid grid-cols-2 gap-4">
         <div className="bg-[#1c1c1e] rounded-3xl p-5 ios-shadow">
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Estimert lønn totalt</h3>
-          <p className="text-2xl font-bold text-white tracking-tight">{formatCurrency(allTimeLonn)}</p>
+          <p className="text-2xl font-bold text-white tracking-tight">{formatCurrency(allTime.gross)}</p>
           <p className="mt-1 text-xs text-gray-500">Basert på registrert timelønn</p>
         </div>
         <div className="bg-[#1c1c1e] rounded-3xl p-5 ios-shadow">
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Feriepenger · estimat</h3>
-          <p className="text-2xl font-bold text-blue-500 tracking-tight">{formatCurrency(allTimeFerie)}</p>
+          <p className="text-2xl font-bold text-blue-500 tracking-tight">{formatCurrency(allTime.holidayPay)}</p>
         </div>
       </div>
 
@@ -377,7 +449,7 @@ function Dashboard({ data, onLogShift }: { data: AppData, onLogShift: () => void
           <Calendar size={20} className="text-blue-500" /> Neste vakt
         </h2>
         {nextShift ? (() => {
-          const job = data.jobs.find(j => j.id === nextShift.jobId);
+          const job = jobs.get(nextShift.jobId);
           const hours = calculatePaidHours(nextShift);
           const pay = estimateShiftPay(nextShift, job);
           return (
@@ -395,28 +467,110 @@ function Dashboard({ data, onLogShift }: { data: AppData, onLogShift: () => void
         )}
       </div>
 
-      {/* Monthly Log */}
-      {monthlyStats.length > 0 && (
-        <div className="bg-[#1c1c1e] rounded-3xl p-6 ios-shadow mt-2">
-          <h2 className="text-lg font-bold text-white mb-5">Månedlig oversikt · estimat</h2>
-          <div className="flex flex-col gap-5">
-            {monthlyStats.map(stat => (
-              <div key={stat.monthDate.toISOString()} className="flex justify-between items-center border-b border-[#2c2c2e] pb-5 last:border-0 last:pb-0">
-                <div>
-                  <h4 className="font-semibold text-white capitalize text-base tracking-wide">{format(stat.monthDate, 'MMMM yyyy', { locale: nb })}</h4>
-                  <p className="text-sm text-gray-400 mt-1 font-medium">{stat.hours.toFixed(1)} timer jobbet</p>
-                </div>
-                <div className="text-right">
-                  <p className="font-bold text-white text-lg tracking-tight">{formatCurrency(stat.totalLonn)}</p>
-                  <p className="text-xs font-semibold text-blue-400 mt-1">+{formatCurrency(stat.totalFerie)} feriepenger</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
+      <MonthlyReport
+        currentMonth={currentMonthKey}
+        months={months}
+        jobs={jobs}
+        reviews={data.monthReviews}
+        onReviewChange={monthReviews => onUpdate({ ...data, monthReviews })}
+      />
     </div>
+  );
+}
+
+const monthLabel = (key: string) => format(parseISO(key + '-01'), 'LLLL yyyy', { locale: nb });
+
+const formatWorkDuration = (minutes: number) => {
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  const parts = [];
+  if (hours > 0) parts.push(hours + ' t');
+  if (remainder > 0 || hours === 0) parts.push(remainder.toLocaleString('nb-NO', { maximumFractionDigits: 2 }) + ' min');
+  return parts.join(' ');
+};
+
+function MonthlyReport({ currentMonth, months, jobs, reviews, onReviewChange }: {
+  currentMonth: string;
+  months: ReturnType<typeof buildMonthlyReports>;
+  jobs: Map<string, Job>;
+  reviews?: AppData['monthReviews'];
+  onReviewChange: (reviews: NonNullable<AppData['monthReviews']>) => void;
+}) {
+  const [selection, setSelection] = useState(currentMonth);
+  const monthKeys = [...new Set([currentMonth, ...months.keys()])].sort().reverse();
+  const monthKey = monthKeys.includes(selection) ? selection : currentMonth;
+  const month = months.get(monthKey);
+  const rows = month ? [...month.byJob.entries()].sort(([a], [b]) => a.localeCompare(b)) : [];
+  const numbersForReview = (totals: WorkTotals) => [
+    totals.count, totals.paid, totals.pause,
+    totals.supplements.toFixed(2), totals.gross.toFixed(2), totals.holidayPay.toFixed(2)
+  ];
+  const signature = month ? JSON.stringify([
+    numbersForReview(month.total),
+    rows.map(([id, totals]) => [id, numbersForReview(totals)])
+  ]) : '';
+  const previousReview = reviews?.[monthKey];
+  const checked = Boolean(month && previousReview === signature);
+
+  const setChecked = (value: boolean) => {
+    if (!month) return;
+    const next = { ...reviews };
+    if (value) next[monthKey] = signature;
+    else delete next[monthKey];
+    onReviewChange(next);
+  };
+
+  return (
+    <section id="maanedsrapport" className="scroll-mt-20 rounded-3xl bg-[#1c1c1e] p-5 ios-shadow" aria-labelledby="month-report-heading">
+      <h2 id="month-report-heading" className="text-lg font-bold">Månedsrapport</h2>
+      <label className="mt-3 flex flex-col gap-1.5 text-sm font-medium text-gray-300">
+        Måned
+        <select value={monthKey} onChange={event => setSelection(event.target.value)} className="min-h-11 w-full rounded-xl bg-[#2c2c2e] px-3 text-base capitalize text-white [color-scheme:dark]">
+          {monthKeys.map(key => <option key={key} value={key}>{monthLabel(key)}</option>)}
+        </select>
+      </label>
+      <p className="mt-3 text-sm text-gray-400">Vakter med status «Jobbet» vises etter startdato. Lønn og feriepenger er estimater.</p>
+
+      {month ? (
+        <div className="mt-4 space-y-3">
+          <MonthlyWorkCard title="Totalt for måneden" totals={month.total} />
+          {rows.map(([id, totals]) => (
+            <MonthlyWorkCard key={id} title={jobs.get(id)?.navn ?? 'Ukjent jobb'} totals={totals} />
+          ))}
+          <label className="flex min-h-12 cursor-pointer items-center gap-3 rounded-xl border border-white/10 px-3 py-2 text-sm font-semibold">
+            <input type="checkbox" checked={checked} onChange={event => setChecked(event.target.checked)} className="h-5 w-5 shrink-0 accent-blue-500" />
+            Sjekket mot lønnsslipp
+          </label>
+          {previousReview && !checked && <p className="text-sm text-orange-300">Tallene har endret seg siden du sjekket rapporten.</p>}
+        </div>
+      ) : (
+        <p className="mt-4 rounded-xl bg-[#2c2c2e] p-4 text-sm text-gray-300">Ingen vakter med status «Jobbet» denne måneden.</p>
+      )}
+    </section>
+  );
+}
+
+function MonthlyWorkCard({ title, totals }: { title: string; totals: WorkTotals }) {
+  const rows = [
+    ['Betalt tid', formatWorkDuration(totals.paid)],
+    ['Ubetalt pause', formatWorkDuration(totals.pause)],
+    ['Registrerte tillegg', formatCurrency(totals.supplements, 2)],
+    ['Estimert brutto før skatt', formatCurrency(totals.gross, 2)],
+    ['Estimerte feriepenger', formatCurrency(totals.holidayPay, 2)]
+  ];
+  return (
+    <article className="rounded-xl bg-[#2c2c2e] p-4">
+      <h3 className="break-words font-semibold">{title}</h3>
+      <p className="mb-3 text-xs text-gray-400">{totals.count} {totals.count === 1 ? 'vakt' : 'vakter'}</p>
+      <dl className="space-y-1.5 text-sm">
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex justify-between gap-3">
+            <dt className="text-gray-300">{label}</dt>
+            <dd className="shrink-0 text-right font-medium tabular-nums">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </article>
   );
 }
 
@@ -459,6 +613,13 @@ function ShiftForm({ data, shift, date, onSave, onCancel, onOpenJobs }: {
     headingRef.current?.focus();
   }, []);
 
+  const overnight = crossesMidnight(draft);
+  const overlaps = findOverlappingShifts(draft, data.shifts, shift?.id);
+  const overlapKey = JSON.stringify([
+    draft.dato, draft.start, draft.slutt,
+    overlaps.map(({ id, dato, start, slutt }) => [id, dato, start, slutt])
+  ]);
+
   const previousShift = !shift
     ? data.shifts
         .filter(item => item.status === 'Fullfort' && availableJobs.some(job => job.id === item.jobId))
@@ -485,7 +646,7 @@ function ShiftForm({ data, shift, date, onSave, onCancel, onOpenJobs }: {
     const rate = Number(draft.timelonn);
     if (!draft.jobId) return setError('Velg en jobb.');
     if (draft.timelonn === '' || !isHourlyRate(rate)) return setError('Skriv inn en gyldig timelønn.');
-    if (draft.pauseMin > calculateHours(draft.start, draft.slutt) * 60) {
+    if (draft.pauseMin > shiftDurationMinutes(draft.start, draft.slutt)) {
       return setError('Pausen kan ikke være lengre enn vakten.');
     }
     if (draft.status === 'Fullfort' && draft.dato > today()) {
@@ -546,7 +707,26 @@ function ShiftForm({ data, shift, date, onSave, onCancel, onOpenJobs }: {
           </label>
           <div className="grid grid-cols-2 gap-3">
             <label className={label}>Start<input type="time" value={draft.start} onChange={event => setDraft({ ...draft, start: event.target.value })} required className={field} /></label>
-            <label className={label}>Slutt<input type="time" value={draft.slutt} onChange={event => setDraft({ ...draft, slutt: event.target.value })} required className={field} /></label>
+            <label className={label}>Slutt<input type="time" value={draft.slutt} onChange={event => setDraft({ ...draft, slutt: event.target.value })} aria-describedby={overnight ? 'overnight-note' : undefined} required className={field} /></label>
+          </div>
+          <div aria-live="polite" className={!overnight && overlaps.length === 0 ? 'sr-only' : undefined}>
+            {overnight && <p id="overnight-note" className="rounded-xl bg-blue-950/40 p-3 text-sm text-blue-200">Vakten slutter neste dag.</p>}
+            {overlaps.length > 0 && (
+              <div className={`rounded-xl border border-orange-500/20 bg-orange-900/30 p-3 text-sm text-orange-200 ${overnight ? 'mt-3' : ''}`}>
+                <p id="overlap-note" className="font-semibold">Tidspunktet overlapper med {overlaps.length === 1 ? 'en annen vakt' : overlaps.length + ' andre vakter'}.</p>
+                <ul className="mt-2 space-y-1">
+                  {overlaps.map(item => (
+                    <li key={item.id}>
+                      {data.jobs.find(job => job.id === item.jobId)?.navn ?? 'Ukjent jobb'} · {item.dato.split('-').reverse().join('.')} · {item.start}–{item.slutt}{crossesMidnight(item) && ' (+1 dag)'}
+                    </li>
+                  ))}
+                </ul>
+                <label className="mt-2 flex min-h-11 cursor-pointer items-center gap-2 font-medium">
+                  <input key={overlapKey} type="checkbox" required aria-describedby="overlap-note" className="h-5 w-5 shrink-0 accent-orange-500" />
+                  Jeg vil lagre vakten likevel
+                </label>
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <label className={label}>Pause (min)<input type="number" min="0" step="1" inputMode="numeric" value={draft.pauseMin} onChange={event => setDraft({ ...draft, pauseMin: Number(event.target.value) })} className={field} /></label>
@@ -938,8 +1118,7 @@ function InnstillingerTab({
       format: 'min-vaktbok-backup',
       version: 1,
       exportedAt: new Date().toISOString(),
-      jobs: data.jobs,
-      shifts: data.shifts
+      ...data
     };
     const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -986,11 +1165,14 @@ function InnstillingerTab({
           pauseMin: Math.max(0, Number(shift.pauseMin) || 0),
           tilleggNok: Math.max(0, Number(shift.tilleggNok) || 0)
         }));
-        onUpdate(withShiftRates({ jobs: normalizedJobs, shifts: normalizedShifts }));
+        onUpdate(withShiftRates({
+          jobs: normalizedJobs,
+          shifts: normalizedShifts,
+          monthReviews: normalizeMonthReviews(importedData.monthReviews)
+        }));
         setAutoBackup({
           savedAt: new Date().toISOString(),
-          jobs: data.jobs,
-          shifts: data.shifts
+          ...data
         });
         setImportStatus({ type: 'success', msg: 'Sikkerhetskopien er importert.' });
       } catch {
@@ -1005,7 +1187,8 @@ function InnstillingerTab({
   const handleRestoreAutoBackup = () => {
     if (!autoBackup) return;
     if (!window.confirm('Gjenopprette forrige automatiske sikkerhetskopi? Dette bytter ut den nåværende vaktlisten.')) return;
-    onUpdate(withShiftRates({ jobs: autoBackup.jobs, shifts: autoBackup.shifts }));
+    const { jobs, shifts, monthReviews } = autoBackup;
+    onUpdate(withShiftRates({ jobs, shifts, monthReviews }));
     setImportStatus({ type: 'success', msg: 'Forrige sikkerhetskopi er gjenopprettet.' });
   };
 
