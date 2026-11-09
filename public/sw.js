@@ -1,10 +1,10 @@
-const CACHE_NAME = 'vakter-app-v1';
+const CACHE_NAME = 'vakter-app-v2';
 const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/vakt-icon.svg', '/vakt-icon-192.png', '/vakt-icon-512.png'];
 
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME).then(async cache => {
-      await cache.addAll(APP_SHELL);
+      await cache.addAll(APP_SHELL.map(path => new Request(path, { cache: 'reload' })));
       const indexResponse = await cache.match('/index.html');
       if (indexResponse) {
         const indexHtml = await indexResponse.text();
@@ -46,7 +46,7 @@ self.addEventListener('fetch', event => {
           }
           return response;
         })
-        .catch(async () => (await caches.match(request)) || caches.match('/index.html'))
+        .catch(async () => (await caches.open(CACHE_NAME)).match('/index.html'))
     );
     return;
   }
