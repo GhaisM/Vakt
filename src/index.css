@@ -7,8 +7,26 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     -webkit-tap-highlight-color: transparent;
-    background-color: #000000;
+    background-color: #0b0f14;
     color: #ffffff;
+  }
+}
+
+button, input, select, summary {
+  touch-action: manipulation;
+}
+
+:focus-visible {
+  outline: 3px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }
 
@@ -24,5 +42,5 @@
 .ios-blur {
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
-  background-color: rgba(28, 28, 30, 0.75);
+  background-color: rgba(17, 19, 24, 0.92);
 }
